@@ -282,7 +282,7 @@ impl OpenVKClient {
     ) -> Result<Vec<ParsedNotification>> {
         let url = format!("{}?act=a_check&key={}&ts={}&wait=25", server_data.server, server_data.key, server_data.ts);
 
-        debug!("Connecting to LongPoll server for updates...");
+        debug!("Connecting to LongPoll server for updates at: {}", url);
 
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -299,24 +299,51 @@ impl OpenVKClient {
         }
 
         let data: serde_json::Value = response.json().await?;
+        
+        info!("📡 LongPoll raw response: {}", serde_json::to_string_pretty(&data)?);
 
         // Update timestamp for next request
         if let Some(new_ts) = data.get("ts").and_then(|v| v.as_u64()) {
             server_data.ts = new_ts;
+            debug!("Updated LongPoll timestamp to: {}", new_ts);
         }
 
         // Parse updates
         let mut notifications = Vec::new();
+        let mut failed_parses = 0;
+        
         if let Some(updates) = data.get("updates").and_then(|v| v.as_array()) {
-            for update in updates {
-                if let Ok(notification) = self.parse_longpoll_event(update) {
-                    notifications.push(notification);
+            info!("🔔 Received {} raw events from LongPoll server", updates.len());
+            
+            for (idx, update) in updates.iter().enumerate() {
+                match self.parse_longpoll_event(update) {
+                    Ok(notification) => {
+                        info!(
+                            "✅ Event {}: Successfully parsed - EventType={:?}, WallOwner={}, PostID={}, CommentID={}, FromID={}",
+                            idx, notification.event_type, notification.wall_owner_id, 
+                            notification.post_id, notification.comment_id, notification.from_id
+                        );
+                        notifications.push(notification);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "⚠️ Event {}: Failed to parse - {} | Raw: {}",
+                            idx, e, serde_json::to_string(update).unwrap_or_default()
+                        );
+                        failed_parses += 1;
+                    }
                 }
             }
+        } else {
+            debug!("No updates field in LongPoll response");
         }
 
         if !notifications.is_empty() {
-            info!("Received {} notifications from LongPoll", notifications.len());
+            info!("✨ Successfully processed {} notifications from LongPoll (failed: {})", notifications.len(), failed_parses);
+        } else if !data.get("updates").is_none() {
+            info!("⚪ No notifications to process (all {} events were filtered/failed)", failed_parses);
+        } else {
+            debug!("No events in this polling cycle");
         }
 
         Ok(notifications)

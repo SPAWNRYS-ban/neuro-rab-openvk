@@ -31,7 +31,15 @@ impl LongPollManager {
         F: FnMut(ParsedNotification) -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<()>>,
     {
+        info!("🚀 Starting LongPoll event loop with auto-reconnection");
+        info!("Config: max_reconnect_attempts={}, backoff_multiplier={}, max_wait_secs={}", 
+            self.config.longpoll_max_reconnect_attempts,
+            self.config.longpoll_backoff_multiplier,
+            self.config.longpoll_max_wait_secs
+        );
+        
         loop {
+            info!("📍 Entering connect_and_listen loop (reconnect_attempts: {})", self.reconnect_attempts);
             match self.connect_and_listen(&mut event_handler).await {
                 Ok(_) => {
                     // Success - reset reconnection counters
@@ -40,7 +48,7 @@ impl LongPollManager {
                     self.current_wait_interval = self.config.longpoll_reconnect_interval_secs;
                 }
                 Err(e) => {
-                    error!("LongPoll connection error: {}. Attempting reconnection...", e);
+                    error!("🔴 LongPoll connection error: {}. Attempting reconnection...", e);
                     self.handle_reconnect().await?;
                 }
             }
@@ -54,31 +62,52 @@ impl LongPollManager {
         Fut: std::future::Future<Output = anyhow::Result<()>>,
     {
         // Get LongPoll server info
+        info!("🔗 Getting LongPoll server connection info...");
         let mut lp_server = self.openvk_client.messages_get_longpoll_server().await?;
-        info!("Connected to LongPoll server");
+        info!("✅ Connected to LongPoll server at: {} (key: {})", 
+            lp_server.server, 
+            &lp_server.key[..lp_server.key.len().min(10)]
+        );
 
         // Listen in a loop
+        let mut listen_cycle = 0;
         loop {
+            listen_cycle += 1;
+            info!("🔄 LongPoll listen cycle #{}", listen_cycle);
+            
             match self
                 .openvk_client
                 .longpoll_listen(&mut lp_server)
                 .await
             {
                 Ok(notifications) => {
-                    // Process each notification
-                    for notification in notifications {
-                        match event_handler(notification.clone()).await {
-                            Ok(_) => {}
-                            Err(e) => {
-                                error!("Error handling notification: {}", e);
-                                // Continue processing other notifications
+                    if !notifications.is_empty() {
+                        info!("📬 Processing {} notifications from LongPoll", notifications.len());
+                        
+                        for (idx, notification) in notifications.iter().enumerate() {
+                            info!(
+                                "  [{}] Processing notification: event_type={:?}, from_id={}, comment_id={}", 
+                                idx, notification.event_type, notification.from_id, notification.comment_id
+                            );
+                            
+                            match event_handler(notification.clone()).await {
+                                Ok(_) => {
+                                    info!("  [{}] ✅ Successfully handled notification", idx);
+                                }
+                                Err(e) => {
+                                    error!("  [{}] ❌ Error handling notification: {}", idx, e);
+                                    // Continue processing other notifications
+                                }
                             }
                         }
+                    } else {
+                        // No notifications this cycle - this is normal
+                        // Don't log here to avoid spam, just continue
                     }
                 }
                 Err(e) => {
                     // Connection error - break and reconnect
-                    error!("LongPoll connection lost: {}", e);
+                    error!("🔴 LongPoll connection lost during cycle #{}: {}", listen_cycle, e);
                     return Err(e);
                 }
             }

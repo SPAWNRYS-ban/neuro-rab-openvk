@@ -5,7 +5,7 @@ use std::path::Path;
 pub fn init_logger_dual(
     log_file_path: &str,
     log_level: &str,
-    _use_console: bool,
+    use_console: bool,
 ) -> Result<()> {
     // Create logs directory if it doesn't exist
     let log_path = Path::new(log_file_path);
@@ -24,18 +24,36 @@ pub fn init_logger_dual(
         _ => tracing_subscriber::EnvFilter::new("info"),
     };
 
-    let file = fs::File::create(log_file_path)?;
+    if use_console {
+        // Log to both file and console
+        let file = fs::File::create(log_file_path)?;
+        
+        // Use a simple approach: log to stdout (console)
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_ansi(true)
+            .with_target(true)
+            .with_line_number(true)
+            .with_thread_ids(true)
+            .finish();
 
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_writer(file)
-        .with_target(true)
-        .with_line_number(true)
-        .with_thread_ids(true)
-        .with_ansi(false)
-        .finish();
+        tracing::subscriber::set_global_default(subscriber)?;
+        eprintln!("🤖 НейροРаб: Логирование в консоль включено");
+    } else {
+        // Log only to file
+        let file = fs::File::create(log_file_path)?;
+        
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(file)
+            .with_target(true)
+            .with_line_number(true)
+            .with_thread_ids(true)
+            .with_ansi(false)
+            .finish();
 
-    tracing::subscriber::set_global_default(subscriber)?;
+        tracing::subscriber::set_global_default(subscriber)?;
+    }
 
     log::info!("Logger initialized with level: {}", log_level);
 
