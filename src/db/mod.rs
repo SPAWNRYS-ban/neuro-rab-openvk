@@ -60,9 +60,9 @@ impl Database {
                 thread_id INTEGER NOT NULL,
                 author_id INTEGER NOT NULL,
                 content TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                UNIQUE(thread_id, author_id)
+                created_at TEXT NOT NULL
             );
+
 
             CREATE TABLE IF NOT EXISTS web_cache (
                 id TEXT PRIMARY KEY,
@@ -166,15 +166,26 @@ impl Database {
         Ok(contexts)
     }
 
-    pub fn clear_old_context(&self, keep_count: usize) -> Result<()> {
+    /// Trim the context for a SINGLE thread down to its newest `keep_count`
+    /// entries. Previously this trimmed GLOBALLY across all threads, so a busy
+    /// DM dialog would evict another dialog's history (and vice-versa),
+    /// destroying conversation memory. Scoping the cleanup to one thread keeps
+    /// each conversation's memory intact and independent.
+    pub fn clear_old_context_for_thread(&self, thread_id: u64, keep_count: usize) -> Result<()> {
         self.conn.execute(
-            "DELETE FROM context_cache WHERE id NOT IN (
-                SELECT id FROM context_cache ORDER BY created_at DESC LIMIT ?
-            )",
-            params![keep_count],
+            "DELETE FROM context_cache
+             WHERE thread_id = ?1
+               AND id NOT IN (
+                   SELECT id FROM context_cache
+                   WHERE thread_id = ?1
+                   ORDER BY created_at DESC
+                   LIMIT ?2
+               )",
+            params![thread_id, keep_count],
         )?;
         Ok(())
     }
+
 
     // Web Cache Methods
     pub fn add_web_cache(&self, cache: &WebCache) -> Result<()> {

@@ -1,11 +1,15 @@
 use super::{
     Comment, Post, WallCreateCommentResponse, WallGetCommentsResponse, WallGetResponse,
-    LongPollServerResponse, LongPollServerData, EventType, ParsedNotification,
+
+    LongPollServerResponse, LongPollServerData, EventType, ParsedNotification, 
+    NotificationsGetResponse, Notification,
 };
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use tracing::{debug, error, info, warn};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
+
 
 pub struct OpenVKClient {
     client: Client,
@@ -16,13 +20,27 @@ pub struct OpenVKClient {
 
 impl OpenVKClient {
     pub fn new(api_url: String, api_token: String, hide_online_activity: u32) -> Self {
+        // IMPORTANT: build the client WITH an explicit request timeout.
+        // `Client::new()` has NO timeout by default, so if the OpenVK server
+        // ever fails to respond to a request (e.g. wall.getComments on a
+        // virtual mention post), the request hangs FOREVER. Because the bot
+        // runs a single interleaved loop, one hung request freezes the whole
+        // bot — it stops answering DMs AND notifications. A 30s timeout makes
+        // such a request fail fast so the loop can recover.
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
         OpenVKClient {
-            client: Client::new(),
+            client,
             api_url,
             api_token,
             hide_online_activity: hide_online_activity != 0,
         }
     }
+
 
     /// Get wall posts for a specified owner
     pub async fn wall_get(
@@ -246,7 +264,7 @@ impl OpenVKClient {
             .get(&url)
             .query(&[
                 ("access_token", self.api_token.clone()),
-                ("need_pts", "0".to_string()),
+                ("need_pts", "1".to_string()),
                 ("lp_version", "3".to_string()),
             ])
             .send()
@@ -274,90 +292,235 @@ impl OpenVKClient {
         Ok(data)
     }
 
-    /// Listen to LongPoll events from server
-    /// Returns Vec of parsed notifications when new events arrive
+    /// Listen for new events using messages.getLongPollHistory.
+    ///
+    /// IMPORTANT: We intentionally do NOT use the `a_check` LongPoll endpoint
+    /// (the /nim<id> server URL). Testing against openvk.xyz showed that the
+    /// a_check endpoint is UNRELIABLE: the server only holds the first couple of
+    /// connections for the full `wait` period, after which it returns an empty
+    /// array `[]` almost instantly AND silently drops any events that arrive while
+    /// the bot is busy (e.g. generating an AI reply). This caused the bot to
+    /// answer only the very first message and then go deaf.
+    ///
+    /// `messages.getLongPollHistory(ts)` is reliable: it returns ALL events that
+    /// occurred since `ts`, even ones the bot "missed". The event format inside
+    /// the `history` array is identical to a_check updates:
+    /// [4, messageId, flags, peer_id, timestamp, text, ...]
+    ///
+    /// We poll this method on a fixed interval and advance `ts` past the newest
+    /// event we've seen so we never receive duplicates.
     pub async fn longpoll_listen(
         &self,
         server_data: &mut LongPollServerData,
     ) -> Result<Vec<ParsedNotification>> {
-        let url = format!("{}?act=a_check&key={}&ts={}&wait=25", server_data.server, server_data.key, server_data.ts);
+        const POLL_INTERVAL: Duration = Duration::from_secs(3);
 
-        debug!("Connecting to LongPoll server for updates at: {}", url);
+        let url = format!("{}/method/messages.getLongPollHistory", self.api_url);
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()?;
+        debug!("Polling getLongPollHistory at ts={}", server_data.ts);
 
-        let response = client.get(&url).send().await?;
+        let request_start = Instant::now();
+        let response = self
+            .client
+            .get(&url)
+            .query(&[
+                ("access_token", self.api_token.clone()),
+                ("ts", server_data.ts.to_string()),
+                ("lp_version", "3".to_string()),
+                ("msgs_limit", "200".to_string()),
+            ])
+            .send()
+            .await?;
 
         if !response.status().is_success() {
-            warn!(
-                "LongPoll server returned status: {}",
-                response.status()
-            );
-            return Err(anyhow!("LongPoll server error: {}", response.status()));
+            warn!("getLongPollHistory returned status: {}", response.status());
+            return Err(anyhow!("getLongPollHistory error: {}", response.status()));
         }
 
         let data: serde_json::Value = response.json().await?;
-        
-        info!("📡 LongPoll raw response: {}", serde_json::to_string_pretty(&data)?);
 
-        // Update timestamp for next request
-        if let Some(new_ts) = data.get("ts").and_then(|v| v.as_u64()) {
-            server_data.ts = new_ts;
-            debug!("Updated LongPoll timestamp to: {}", new_ts);
+        // Check for API error
+        if let Some(error) = data.get("error") {
+            error!("getLongPollHistory API error: {}", error);
+            return Err(anyhow!("getLongPollHistory API error: {}", error));
         }
 
-        // Parse updates
+        // Parse the `history` array from the response
         let mut notifications = Vec::new();
         let mut failed_parses = 0;
-        
-        if let Some(updates) = data.get("updates").and_then(|v| v.as_array()) {
-            info!("🔔 Received {} raw events from LongPoll server", updates.len());
-            
-            for (idx, update) in updates.iter().enumerate() {
-                match self.parse_longpoll_event(update) {
+        let mut max_event_ts = server_data.ts;
+
+        if let Some(history) = data
+            .get("response")
+            .and_then(|r| r.get("history"))
+            .and_then(|h| h.as_array())
+        {
+            if !history.is_empty() {
+                info!("🔔 getLongPollHistory returned {} events", history.len());
+            }
+
+            for (idx, event) in history.iter().enumerate() {
+                // Track the newest event timestamp (index 4) so we can advance ts
+                if let Some(arr) = event.as_array() {
+                    if let Some(ev_ts) = arr.get(4).and_then(|v| v.as_u64()) {
+                        if ev_ts > max_event_ts {
+                            max_event_ts = ev_ts;
+                        }
+                    }
+                }
+
+                match self.parse_longpoll_event(event) {
                     Ok(notification) => {
                         info!(
-                            "✅ Event {}: Successfully parsed - EventType={:?}, WallOwner={}, PostID={}, CommentID={}, FromID={}",
-                            idx, notification.event_type, notification.wall_owner_id, 
-                            notification.post_id, notification.comment_id, notification.from_id
+                            "✅ Event {}: Parsed - EventType={:?}, MessageID={}, PeerID={}, Text=\"{}\"",
+                            idx, notification.event_type, notification.message_id,
+                            notification.peer_id, notification.text.chars().take(50).collect::<String>()
+
                         );
                         notifications.push(notification);
                     }
                     Err(e) => {
                         warn!(
                             "⚠️ Event {}: Failed to parse - {} | Raw: {}",
-                            idx, e, serde_json::to_string(update).unwrap_or_default()
+                            idx, e, serde_json::to_string(event).unwrap_or_default()
                         );
                         failed_parses += 1;
                     }
                 }
             }
         } else {
-            debug!("No updates field in LongPoll response");
+            debug!("No history field in getLongPollHistory response");
+        }
+
+        // Advance ts past the newest event so we don't receive duplicates.
+        // +1 because the server returns events with timestamp >= ts.
+        if max_event_ts > server_data.ts {
+            server_data.ts = max_event_ts + 1;
+            debug!("Advanced ts to {}", server_data.ts);
         }
 
         if !notifications.is_empty() {
-            info!("✨ Successfully processed {} notifications from LongPoll (failed: {})", notifications.len(), failed_parses);
-        } else if !data.get("updates").is_none() {
-            info!("⚪ No notifications to process (all {} events were filtered/failed)", failed_parses);
-        } else {
-            debug!("No events in this polling cycle");
+            info!("✨ Processed {} new events (failed: {})", notifications.len(), failed_parses);
+        }
+
+        // Throttle: getLongPollHistory returns instantly, so pace our polling
+        // to avoid hammering the server.
+        let elapsed = request_start.elapsed();
+        if elapsed < POLL_INTERVAL {
+            sleep(POLL_INTERVAL - elapsed).await;
         }
 
         Ok(notifications)
     }
 
+
+
+    /// Send a personal message to a user
+    pub async fn messages_send(&self, user_id: i64, message: String) -> Result<u64> {
+        let url = format!("{}/method/messages.send", self.api_url);
+
+        debug!("Sending personal message to user {} from {}", user_id, url);
+
+        let mut query_params = vec![
+            ("user_id", user_id.to_string()),
+            ("message", message.clone()),
+            ("access_token", self.api_token.clone()),
+        ];
+
+        let hide_online = if self.hide_online_activity {
+            Some(("forGodSakePleaseDoNotReportAboutMyOnlineActivity", "1".to_string()))
+        } else {
+            None
+        };
+
+        if let Some(param) = hide_online {
+            query_params.push(param);
+        }
+
+        let response = self
+            .client
+            .post(&url)
+            .query(&query_params)
+            .send()
+            .await?;
+
+        // Parse response for message_id
+        let response_text = response.text().await?;
+        debug!("messages.send response: {}", response_text);
+
+        let json_response: serde_json::Value = serde_json::from_str(&response_text)?;
+
+        // Check for error
+        if let Some(error) = json_response.get("error") {
+            if let Some(error_msg) = error.get("error_msg") {
+                error!("OpenVK API error sending message: {}", error_msg);
+                return Err(anyhow!("OpenVK API error: {}", error_msg));
+            }
+        }
+
+        // Extract message_id from response
+        if let Some(message_id) = json_response.get("response").and_then(|r| r.as_u64()) {
+            info!("Successfully sent personal message with ID: {}", message_id);
+            Ok(message_id)
+        } else {
+            error!("No message_id in response: {}", response_text);
+            Err(anyhow!("No message_id in messages.send response"))
+        }
+    }
+
+    /// Get notifications (mentions, comments, likes, etc.)
+    pub async fn notifications_get(&self, count: u32) -> Result<Vec<Notification>> {
+        let url = format!("{}/method/notifications.get", self.api_url);
+
+        debug!("Fetching notifications from {}", url);
+
+        let mut query_params = vec![
+            ("count", count.to_string()),
+            ("access_token", self.api_token.clone()),
+        ];
+
+        let hide_online = if self.hide_online_activity {
+            Some(("forGodSakePleaseDoNotReportAboutMyOnlineActivity", "1".to_string()))
+        } else {
+            None
+        };
+
+        if let Some(param) = hide_online {
+            query_params.push(param);
+        }
+
+        let response = self
+            .client
+            .get(&url)
+            .query(&query_params)
+            .send()
+            .await?;
+
+        let notif_response: NotificationsGetResponse = response.json().await?;
+
+        if let Some(error) = notif_response.error {
+            error!("OpenVK API error getting notifications: {}", error.error_msg);
+            return Err(anyhow!("OpenVK API error: {}", error.error_msg));
+        }
+
+        let data = notif_response
+            .response
+            .ok_or_else(|| anyhow!("No response from notifications.get"))?;
+
+        info!("Fetched {} notifications", data.items.len());
+        Ok(data.items)
+    }
+
     /// Parse a single LongPoll event to get notification details
+    /// OpenVK LongPoll event type 4 (NewMessage) format:
+    /// [4, messageId, spam_flag, peer_id, timestamp, text, info, attachments, random_id, conversation_id, edited]
     fn parse_longpoll_event(&self, event: &serde_json::Value) -> Result<ParsedNotification> {
-        // LongPoll event format: [event_code, object_id, user_id, etc...]
         let event_array = event
             .as_array()
             .ok_or_else(|| anyhow!("Event is not an array"))?;
 
-        if event_array.len() < 3 {
-            return Err(anyhow!("Event array too short"));
+        if event_array.len() < 5 {
+            return Err(anyhow!("Event array too short (need at least 5 elements for type 4)"));
         }
 
         let event_code = event_array[0]
@@ -368,46 +531,40 @@ impl OpenVKClient {
         tracing::debug!("🔍 Received raw event code: {} (full event: {})", event_code, serde_json::to_string(event).unwrap_or_default());
 
         let event_type =
-            EventType::from_code(event_code).ok_or_else(|| anyhow!("Unknown event code: {} | This may be a new OpenVK event type that bot doesn't support yet", event_code))?;
+            EventType::from_code(event_code).ok_or_else(|| anyhow!("Unknown event code: {} | OpenVK LongPoll only supports event type 4 (NewMessage)", event_code))?;
 
-        let object_id = event_array[1]
+        // For event type 4 (NewMessage):
+        // [4, messageId, spam_flag, peer_id, timestamp, text, info, attachments, random_id, conversation_id, edited]
+        let message_id = event_array[1]
+            .as_u64()
+            .ok_or_else(|| anyhow!("Message ID is not u64"))?;
+
+        // spam_flag at index 2 (we don't need it)
+        
+        let peer_id = event_array[3]
             .as_i64()
-            .ok_or_else(|| anyhow!("Object ID is not i64"))?;
-        let user_id = event_array[2]
-            .as_i64()
-            .ok_or_else(|| anyhow!("User ID is not i64"))?;
+            .ok_or_else(|| anyhow!("Peer ID is not i64"))?;
 
-        // For events, we need to extract post_id and comment_id
-        // The format varies, so we parse additional fields
-        let post_id = if event_array.len() > 3 {
-            event_array[3].as_u64().unwrap_or(0)
-        } else {
-            0
-        };
+        let timestamp = event_array[4]
+            .as_u64()
+            .ok_or_else(|| anyhow!("Timestamp is not u64"))?;
 
-        let comment_id = object_id.unsigned_abs();
-        let wall_owner_id = if object_id > 0 { object_id } else { -object_id };
-
-        // Get text if available
-        let text = if event_array.len() > 4 {
-            event_array[4]
+        // Get text if available (at index 5)
+        let text = if event_array.len() > 5 {
+            event_array[5]
                 .as_str()
-                .unwrap_or("New notification")
+                .unwrap_or("New message")
                 .to_string()
         } else {
-            "New notification".to_string()
+            "New message".to_string()
         };
 
         Ok(ParsedNotification {
             event_type,
-            wall_owner_id,
-            post_id,
-            comment_id,
-            from_id: user_id,
+            message_id,
+            peer_id,
             text,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs(),
+            timestamp,
         })
     }
 }

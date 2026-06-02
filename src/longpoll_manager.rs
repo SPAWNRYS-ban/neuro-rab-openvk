@@ -89,8 +89,8 @@ impl LongPollManager {
                         
                         for (idx, notification) in notifications.iter().enumerate() {
                             info!(
-                                "  [{}] Processing notification: event_type={:?}, from_id={}, comment_id={}", 
-                                idx, notification.event_type, notification.from_id, notification.comment_id
+                                "  [{}] Processing notification: event_type={:?}, peer_id={}, message_id={}", 
+                                idx, notification.event_type, notification.peer_id, notification.message_id
                             );
                             
                             match event_handler(notification.clone()).await {

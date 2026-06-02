@@ -4,33 +4,39 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info};
 
+// tokenator.cloud uses an OpenAI-compatible API format
 #[derive(Debug, Clone, Serialize)]
 struct ClaudeRequest {
     model: String,
     max_tokens: u32,
     messages: Vec<Message>,
-    system: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct ClaudeMessageResponse {
-    content: Vec<ContentBlock>,
-    stop_reason: String,
+    choices: Vec<Choice>,
     usage: Option<Usage>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ContentBlock {
-    #[serde(rename = "type")]
-    block_type: String,
-    text: Option<String>,
+struct Choice {
+    message: ChoiceMessage,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ChoiceMessage {
+    role: String,
+    content: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct Usage {
-    input_tokens: u32,
-    output_tokens: u32,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    total_tokens: u32,
 }
+
 
 pub struct ClaudeAI {
     client: Client,
@@ -50,22 +56,32 @@ impl ClaudeAI {
     }
 
     pub async fn chat(&self, messages: Vec<Message>, system: Option<String>) -> Result<String> {
-        let url = format!("{}/messages", self.api_url);
+        // tokenator.cloud uses OpenAI-compatible endpoint
+        let url = format!("{}/chat/completions", self.api_url);
 
-        debug!("Sending request to Claude API: {}", url);
+        debug!("Sending request to Claude API (OpenAI-compatible): {}", url);
+
+        // In OpenAI format, the system prompt is passed as the first message with role="system"
+        let mut full_messages = Vec::new();
+        if let Some(system_prompt) = system {
+            full_messages.push(Message {
+                role: "system".to_string(),
+                content: system_prompt,
+            });
+        }
+        full_messages.extend(messages);
 
         let request = ClaudeRequest {
             model: self.model.clone(),
             max_tokens: 1024,
-            messages,
-            system,
+            messages: full_messages,
         };
 
         let response = self
             .client
             .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
+            .header("Authorization", format!("Bearer {}", &self.api_key))
+            .header("Content-Type", "application/json")
             .json(&request)
             .send()
             .await?;
@@ -79,16 +95,16 @@ impl ClaudeAI {
         let claude_response: ClaudeMessageResponse = response.json().await?;
 
         let content = claude_response
-            .content
-            .iter()
-            .find(|c| c.block_type == "text")
-            .and_then(|c| c.text.clone())
-            .ok_or_else(|| anyhow!("No text content in Claude response"))?;
+            .choices
+            .first()
+            .map(|c| c.message.content.clone())
+            .ok_or_else(|| anyhow!("No choices in Claude response"))?;
 
         info!("Received response from Claude API");
 
         Ok(content)
     }
+
 
     pub async fn generate_response(
         &self,

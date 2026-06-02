@@ -13,15 +13,26 @@ use config::{Config, BotMode};
 use context::{ContextManager, MentionDetector};
 use db::Database;
 use log::{error, info};
-use longpoll_manager::LongPollManager;
-use openvk::{OpenVKClient, ParsedNotification};
+use openvk::{OpenVKClient, ParsedNotification, Comment, Notification};
+
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use web::{DuckDuckGoSearch, WebScraper};
 
+/// Safely truncate a string to at most `max_chars` CHARACTERS (not bytes).
+///
+/// Rust string slicing (`&s[..n]`) panics if `n` falls inside a multi-byte
+/// UTF-8 character — which it does constantly with Cyrillic text. This helper
+/// truncates on a character boundary so it can NEVER panic. Used for log
+/// previews and for trimming responses to the OpenVK length limit.
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+
     // Load configuration from environment
     let config = Config::from_env()?;
 
@@ -123,7 +134,17 @@ async fn run_wall_polling(
     }
 }
 
-/// Run bot in global LongPoll mode
+/// Run bot in global mode.
+///
+/// We run a single manual loop (NOT tokio::spawn, because `Database` is not
+/// `Send`) that interleaves two pollers:
+///   1. LongPoll history polling (messages.getLongPollHistory) for personal
+///      messages — handled by `handle_longpoll_notification`.
+///   2. Notifications polling (notifications.get) for @mentions and comments on
+///      posts — handled by `handle_notification`.
+///
+/// Both share the same OpenVK client and run sequentially, so there are no
+/// thread-safety issues with the SQLite-backed Database.
 async fn run_longpoll_listener(
     openvk_client: Arc<OpenVKClient>,
     claude_ai: &ClaudeAI,
@@ -133,46 +154,281 @@ async fn run_longpoll_listener(
     db: &Arc<Database>,
     config: &Config,
 ) -> Result<()> {
-    info!("Starting global LongPoll listener mode");
-    let mut lp_manager = LongPollManager::new(openvk_client.clone(), config.clone());
+    info!("Starting global mode (LongPoll DMs + Notifications mentions/comments)");
 
-    // Clone data for use in the event handler closure
-    let openvk_client_clone = openvk_client.clone();
-    let claude_ai_clone = claude_ai.clone();
-    let search_engine_clone = search_engine.clone();
-    let scraper_clone = scraper.clone();
-    let context_manager_clone = context_manager.clone();
-    let db_clone = db.clone();
-    let config_clone = config.clone();
+    // Record the bot's startup time (unix epoch). We only respond to
+    // notifications (mentions/comments) that arrive AFTER this moment, so the
+    // bot doesn't flood-reply to every old mention sitting in the feed when it
+    // (re)starts.
+    let started_at: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    info!("Notification cutoff: only replying to events after {}", started_at);
 
-    lp_manager
-        .run_with_reconnect(move |notification: ParsedNotification| {
-            let openvk = openvk_client_clone.clone();
-            let ai = claude_ai_clone.clone();
-            let search = search_engine_clone;
-            let scraper_inner = scraper_clone;
-            let ctx_mgr = context_manager_clone;
-            let database = db_clone.clone();
-            let cfg = config_clone.clone();
+    // Initialize the LongPoll server data (gives us the starting `ts`).
+    let mut server_data = openvk_client.messages_get_longpoll_server().await?;
 
-            async move {
-                handle_longpoll_notification(
-                    notification,
-                    openvk.as_ref(),
-                    &ai,
-                    &search,
-                    &scraper_inner,
-                    &ctx_mgr,
-                    &database,
-                    &cfg,
-                )
-                .await
+
+    // Throttle the notifications poll so we don't hit the API every cycle.
+    let notif_interval = Duration::from_secs(10);
+    let mut last_notif_poll = std::time::Instant::now()
+        .checked_sub(notif_interval)
+        .unwrap_or_else(std::time::Instant::now);
+
+    loop {
+        // --- 1. Poll personal messages via LongPoll history ---
+        match openvk_client.longpoll_listen(&mut server_data).await {
+            Ok(notifications) => {
+                for notification in notifications {
+                    if let Err(e) = handle_longpoll_notification(
+                        notification,
+                        openvk_client.as_ref(),
+                        claude_ai,
+                        search_engine,
+                        scraper,
+                        context_manager,
+                        db,
+                        config,
+                    )
+                    .await
+                    {
+                        error!("Error handling LongPoll DM: {}", e);
+                    }
+                }
             }
-        })
-        .await
+            Err(e) => {
+                error!("LongPoll error: {} — re-fetching server, retrying in 3s", e);
+                sleep(Duration::from_secs(3)).await;
+                if let Ok(sd) = openvk_client.messages_get_longpoll_server().await {
+                    server_data = sd;
+                }
+            }
+        }
+
+        // --- 2. Poll notifications (mentions + comments) periodically ---
+        if last_notif_poll.elapsed() >= notif_interval {
+            last_notif_poll = std::time::Instant::now();
+            match openvk_client.notifications_get(20).await {
+                Ok(notifs) => {
+                    for notif in &notifs {
+                        if let Err(e) = handle_notification(
+                            notif,
+                            openvk_client.as_ref(),
+                            claude_ai,
+                            search_engine,
+                            scraper,
+                            context_manager,
+                            db,
+                            config,
+                            started_at,
+                        )
+                        .await
+                        {
+                            error!("Error handling notification: {}", e);
+                        }
+                    }
+
+                }
+                Err(e) => error!("notifications.get error: {}", e),
+            }
+        }
+    }
 }
 
+
+/// Handle a single notification from notifications.get.
+///
+/// Real OpenVK format (from Notification::toVkApiStruct / getVkApiInfo):
+///   - type = "mention":      feedback = the POST the bot was mentioned in
+///                            (NotifObject: id=post_virtual_id, to_id=wall_owner, from_id, text)
+///   - type = "comment_post": parent   = the POST, feedback = the COMMENT
+///                            (comment NotifObject: id=comment_id, owner_id, text)
+///
+/// We respond by posting a comment (or reply) on the post, and we load the
+/// whole comment thread into context first so the bot knows the conversation.
+async fn handle_notification(
+    notif: &Notification,
+    openvk_client: &OpenVKClient,
+    claude_ai: &ClaudeAI,
+    search_engine: &DuckDuckGoSearch,
+    scraper: &WebScraper,
+    context_manager: &ContextManager,
+    db: &Arc<Database>,
+    config: &Config,
+    started_at: u64,
+) -> Result<()> {
+    let ntype = notif.notification_type.as_deref().unwrap_or("");
+
+    // We only care about mentions in posts and comments on posts.
+    let is_mention = ntype == "mention";
+    let is_comment_post = ntype == "comment_post";
+    if !is_mention && !is_comment_post {
+        return Ok(());
+    }
+
+    // Skip notifications that happened BEFORE the bot started, so we don't
+    // flood-reply to a backlog of old mentions on (re)start.
+    let notif_date = notif.date.unwrap_or(0);
+    if notif_date < started_at {
+        return Ok(());
+    }
+
+
+    // Determine the POST object (where to comment) and the text/author that
+    // triggered the notification.
+    // - For "mention": the post itself is in `feedback`.
+    // - For "comment_post": the post is in `parent`, the comment is in `feedback`.
+    let post_obj = if is_mention {
+        notif.feedback.as_ref()
+    } else {
+        notif.parent.as_ref()
+    };
+
+    let post_obj = match post_obj {
+        Some(p) => p,
+        None => {
+            info!("Notification ({}) has no post object, skipping", ntype);
+            return Ok(());
+        }
+    };
+
+    // Post id: for a post NotifObject this is `id`; wall owner is `to_id`.
+    let post_id = match post_obj.id {
+        Some(id) => id as u64,
+        None => {
+            info!("Notification ({}) post has no id, skipping", ntype);
+            return Ok(());
+        }
+    };
+    let owner_id = post_obj.to_id.or(post_obj.owner_id).unwrap_or(0);
+
+    // The text that triggered us + the author who wrote it.
+    let trigger = notif.feedback.as_ref();
+    let trigger_text = trigger.and_then(|f| f.text.clone()).unwrap_or_default();
+    let trigger_author = trigger
+        .and_then(|f| f.from_id.or(f.owner_id))
+        .unwrap_or(owner_id);
+
+    // For comment_post we only respond if the bot is actually mentioned.
+    if is_comment_post
+        && !MentionDetector::contains_mention(&trigger_text, &config.bot_mention_prefix)
+    {
+        return Ok(());
+    }
+
+    // Deduplicate using a STABLE key derived from the triggering object id
+    // (feedback.id). For a "mention" this is the post id; for "comment_post"
+    // this is the comment id. We must NOT mix in `notif.date`, because OpenVK
+    // returns the SAME mention multiple times with DIFFERENT dates, which
+    // would otherwise make the bot answer the same mention repeatedly.
+    //
+    // We namespace the two notification kinds so a post id and a comment id
+    // can never collide.
+    let trigger_id = trigger.and_then(|f| f.id).unwrap_or(post_id as i64) as u64;
+    let dedup_id: u64 = if is_mention {
+        trigger_id.wrapping_mul(10).wrapping_add(1)
+    } else {
+        trigger_id.wrapping_mul(10).wrapping_add(2)
+    };
+    if db.is_comment_processed(dedup_id)? {
+        return Ok(());
+    }
+
+
+    info!(
+        "📨 Handling {} on post {}_{} | trigger=\"{}\"",
+        ntype, owner_id, post_id,
+        truncate_str(&trigger_text, 60)
+    );
+
+
+    // Load the whole comment thread into context so the bot knows the conversation.
+    if let Ok(comments) = openvk_client.wall_get_comments(owner_id, post_id, 100, 0).await {
+        for c in &comments {
+            context_manager
+                .add_comment_context(
+                    owner_id,
+                    post_id,
+                    c.author_id,
+                    c.author_id.to_string(),
+                    c.text.clone(),
+                )
+                .await
+                .ok();
+        }
+    }
+
+    // Build a synthetic Comment for the AI generator using the trigger text.
+    let trigger_comment = Comment {
+        id: dedup_id,
+        owner_id,
+        author_id: trigger_author.unsigned_abs(),
+        text: if trigger_text.is_empty() {
+            format!("{} ?", config.bot_mention_prefix)
+        } else {
+            trigger_text.clone()
+        },
+        reply_to_comment: None,
+        reply_to_user: None,
+        date: notif.date.unwrap_or(0),
+        likes_count: None,
+        likes: None,
+        attachments: None,
+        can_edit: None,
+        can_delete: None,
+    };
+
+    match generate_bot_response(
+        &trigger_comment,
+        claude_ai,
+        search_engine,
+        scraper,
+        context_manager,
+        config,
+        owner_id,
+        post_id,
+    )
+    .await
+    {
+        Ok(response) => {
+            match openvk_client
+                .wall_create_comment(owner_id, post_id, response.clone())
+                .await
+            {
+                Ok(cid) => {
+                    info!("✅ Posted comment {} on post {}_{}", cid, owner_id, post_id);
+                    // Record the bot's own answer into context too.
+                    context_manager
+                        .add_comment_context(
+                            owner_id,
+                            post_id,
+                            config.openvk_bot_id,
+                            config.bot_name.clone(),
+                            response.clone(),
+                        )
+                        .await
+                        .ok();
+                    db.add_processed_comment(&db::ProcessedComment {
+                        comment_id: dedup_id,
+                        wall_owner_id: owner_id,
+                        comment_text: trigger_text,
+                        bot_response: response,
+                        processed_at: chrono::Utc::now().to_rfc3339(),
+                    })?;
+                }
+                Err(e) => error!("Failed to post comment response: {}", e),
+            }
+        }
+        Err(e) => error!("Failed to generate response for {}: {}", ntype, e),
+    }
+
+    Ok(())
+}
+
+
 /// Handle a single LongPoll notification
+/// OpenVK LongPoll only supports event type 4 (NewMessage from direct messages)
 async fn handle_longpoll_notification(
     notification: ParsedNotification,
     openvk_client: &OpenVKClient,
@@ -184,84 +440,117 @@ async fn handle_longpoll_notification(
     config: &Config,
 ) -> Result<()> {
     info!(
-        "Handling LongPoll notification: event_type={:?}, wall_owner={}, post_id={}, comment_id={}",
-        notification.event_type, notification.wall_owner_id, notification.post_id, notification.comment_id
+        "🔔 Handling LongPoll notification: event_type={:?}, from_user={}, message_id={}, text=\"{}\"",
+        notification.event_type, notification.peer_id, notification.message_id, 
+        truncate_str(&notification.text, 100)
     );
 
-    // Check if comment has already been processed
-    if db.is_comment_processed(notification.comment_id)? {
-        info!("Comment {} already processed, skipping", notification.comment_id);
+
+    // Check if message has already been processed
+    if db.is_comment_processed(notification.message_id)? {
+        info!("Message {} already processed, skipping", notification.message_id);
         return Ok(());
     }
 
-    // Fetch the full comment to get author info
-    let comments = openvk_client
-        .wall_get_comments(notification.wall_owner_id, notification.post_id, 100, 0)
-        .await?;
-
-    let comment = match comments.iter().find(|c| c.id == notification.comment_id) {
-        Some(c) => c,
-        None => {
-            error!(
-                "Could not find comment {} in post {}_{}",
-                notification.comment_id, notification.wall_owner_id, notification.post_id
-            );
-            return Ok(());
-        }
-    };
-
+    // For direct messages in LongPoll, we simply respond to the user directly
+    // This is a personal message, so we respond back in a personal message
+    
     info!(
-        "Processing comment {} from user {} - content: {}",
-        comment.id, comment.author_id, comment.text
+        "Processing personal message from user {} - content: {}",
+        notification.peer_id, notification.text
     );
 
-    // Add comment to context
+    // Use peer_id as the conversation thread id so each DM dialog has its own
+    // isolated context (previously hardcoded 0, mixing ALL users together).
+    let dm_thread_id = notification.peer_id.unsigned_abs();
+
+    // Add the user's message to this conversation's context
     context_manager
         .add_comment_context(
-            notification.wall_owner_id,
-            notification.post_id,
-            comment.author_id,
-            comment.author_id.to_string(),
-            comment.text.clone(),
+            notification.peer_id,           // wall_owner = the peer
+            dm_thread_id,                    // thread per-user (was 0 for everyone!)
+            notification.peer_id.unsigned_abs(),
+            notification.peer_id.to_string(),
+            notification.text.clone(),
         )
         .await?;
 
-    // Generate AI response
+
+    // Create a dummy Comment struct for generate_bot_response
+    let dummy_comment = Comment {
+        id: notification.message_id,
+        owner_id: notification.peer_id,
+        author_id: notification.peer_id as u64,
+        text: notification.text.clone(),
+        reply_to_comment: None,
+        reply_to_user: None,
+        date: notification.timestamp,
+        likes_count: None,
+        likes: None,
+        attachments: None,
+        can_edit: None,
+        can_delete: None,
+    };
+
+    // Generate AI response (use dm_thread_id so context is per-conversation)
     match generate_bot_response(
-        comment,
+        &dummy_comment,
         claude_ai,
         search_engine,
         scraper,
         context_manager,
         config,
-        notification.wall_owner_id,
-        notification.post_id,
+        notification.peer_id,
+        dm_thread_id,
     )
     .await
     {
-        Ok(response) => {
-            // Post the response
-            if let Err(e) = openvk_client
-                .wall_create_comment_reply(
-                    notification.wall_owner_id,
-                    notification.post_id,
-                    comment.id,
-                    response.clone(),
-                )
-                .await
-            {
-                error!("Failed to post bot response: {}", e);
-            } else {
-                info!("Successfully posted bot response to comment {}", comment.id);
+        Ok(mut response) => {
+            info!(
+                "💬 Generated response to personal message from user {}: {}",
+                notification.peer_id, truncate_str(&response, 100)
+            );
 
-                // Store processed comment in database
-                db.add_processed_comment(&db::ProcessedComment {
-                    comment_id: comment.id,
-                    wall_owner_id: notification.wall_owner_id,
-                    comment_text: comment.text.clone(),
-                    bot_response: response,
-                    processed_at: chrono::Utc::now().to_rfc3339(),
-                })?;
+            // Limit response length for OpenVK API (max message length). Char-safe.
+            if response.chars().count() > 10000 {
+                response = format!("{}...", truncate_str(&response, 9997));
+            }
+
+
+            // Send response as personal message back to the user
+            match openvk_client.messages_send(notification.peer_id, response.clone()).await {
+                Ok(sent_message_id) => {
+                    info!(
+                        "✅ Successfully sent DM response to user {} with message ID: {}",
+                        notification.peer_id, sent_message_id
+                    );
+
+                    // Save the bot's OWN reply into the conversation context so it
+                    // remembers what it said (gives real dialog memory).
+                    context_manager
+                        .add_comment_context(
+                            notification.peer_id,
+                            dm_thread_id,
+                            config.openvk_bot_id,
+                            config.bot_name.clone(),
+                            response.clone(),
+                        )
+                        .await
+                        .ok();
+
+                    // Store processed message in database
+                    db.add_processed_comment(&db::ProcessedComment {
+                        comment_id: notification.message_id,
+                        wall_owner_id: notification.peer_id,
+                        comment_text: notification.text.clone(),
+                        bot_response: response,
+                        processed_at: chrono::Utc::now().to_rfc3339(),
+                    })?;
+                }
+
+                Err(e) => {
+                    error!("Failed to send personal message response to user {}: {}", notification.peer_id, e);
+                }
             }
         }
         Err(e) => {
@@ -471,13 +760,13 @@ async fn generate_bot_response(
     // Check for URLs in the comment and scrape if needed
     extract_and_analyze_urls(&clean_text, claude_ai, scraper, &mut final_response).await?;
 
-    // Limit response length for OpenVK API (max comment length)
-    if final_response.len() > 10000 {
-        final_response.truncate(9997);
-        final_response.push_str("...");
+    // Limit response length for OpenVK API (max comment length). Char-safe.
+    if final_response.chars().count() > 10000 {
+        final_response = format!("{}...", truncate_str(&final_response, 9997));
     }
 
     Ok(final_response)
+
 }
 
 async fn extract_and_analyze_urls(
@@ -496,14 +785,12 @@ async fn extract_and_analyze_urls(
             // Try to fetch and analyze the page content
             match scraper.fetch_content(url).await {
                 Ok(content) => {
-                    // Limit content for analysis (take first 5000 chars)
-                    let limited_content = if content.text.len() > 5000 {
-                        &content.text[..5000]
-                    } else {
-                        &content.text
-                    };
+                    // Limit content for analysis (take first 5000 chars,
+                    // char-safe so multi-byte UTF-8 never panics).
+                    let limited_content = truncate_str(&content.text, 5000);
 
-                    if let Ok(analysis) = claude_ai.analyze_web_content(url, limited_content).await {
+                    if let Ok(analysis) = claude_ai.analyze_web_content(url, &limited_content).await {
+
                         response.push_str("\n\n📄 Анализ ссылки:\n");
                         response.push_str(&analysis);
                     }

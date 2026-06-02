@@ -32,10 +32,13 @@ impl ContextManager {
         };
 
         self.db.add_context_entry(&entry)?;
-        self.cleanup_old_context().await?;
+        // Trim ONLY this thread's history (per-conversation), so other DM
+        // dialogs / post threads keep their own memory intact.
+        self.cleanup_old_context(thread_id).await?;
 
         Ok(())
     }
+
 
     /// Get all context for a specific thread
     pub async fn get_thread_context(&self, thread_id: u64) -> Result<Vec<(String, String)>> {
@@ -76,11 +79,13 @@ impl ContextManager {
         Ok(context)
     }
 
-    /// Clean up old context entries
-    async fn cleanup_old_context(&self) -> Result<()> {
-        self.db.clear_old_context(self.memory_size)?;
+    /// Clean up old context entries for ONE thread/conversation.
+    async fn cleanup_old_context(&self, thread_id: u64) -> Result<()> {
+        self.db
+            .clear_old_context_for_thread(thread_id, self.memory_size)?;
         Ok(())
     }
+
 
     /// Clear context for a specific thread
     pub async fn clear_thread_context(&self, _thread_id: u64) -> Result<()> {

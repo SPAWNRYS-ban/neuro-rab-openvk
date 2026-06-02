@@ -41,7 +41,15 @@ pub fn init_logger_dual(
         }
     }
 
+    // Bridge the `log` crate (used by log::info! in main.rs) into `tracing`.
+    // Without this, ANY log::info!/error! call is silently dropped because our
+    // subscriber only captures `tracing` events. `set_global_default` does NOT
+    // install this bridge automatically (only `.init()` would), so we do it
+    // explicitly here. Ignore the error if it's already set.
+    let _ = tracing_log::LogTracer::init();
+
     let level_str = log_level.to_lowercase();
+
     let env_filter = match level_str.as_str() {
         "debug" => tracing_subscriber::EnvFilter::new("debug"),
         "warn" => tracing_subscriber::EnvFilter::new("warn"),
