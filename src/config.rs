@@ -1,12 +1,33 @@
 use anyhow::Result;
 use std::env;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum BotMode {
+    Wall,   // Monitor single wall (legacy mode)
+    Global, // Monitor global mentions via LongPoll
+}
+
+impl BotMode {
+    pub fn from_string(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "wall" => BotMode::Wall,
+            "global" => BotMode::Global,
+            _ => BotMode::Global, // default
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub openvk_api_url: String,
     pub openvk_api_token: String,
     pub openvk_bot_id: u64,
     pub openvk_hide_online_activity: u32,
+    pub bot_mode: BotMode,
+    pub longpoll_reconnect_interval_secs: u64,
+    pub longpoll_max_reconnect_attempts: u32,
+    pub longpoll_backoff_multiplier: f64,
+    pub longpoll_max_wait_secs: u64,
     pub claude_api_url: String,
     pub claude_api_key: String,
     pub claude_model: String,
@@ -36,6 +57,21 @@ impl Config {
                 .parse()?,
             openvk_hide_online_activity: env::var("OPENVK_HIDE_ONLINE_ACTIVITY")
                 .unwrap_or_else(|_| "0".to_string())
+                .parse()?,
+            bot_mode: BotMode::from_string(
+                &env::var("BOT_MODE").unwrap_or_else(|_| "global".to_string()),
+            ),
+            longpoll_reconnect_interval_secs: env::var("LONGPOLL_RECONNECT_INTERVAL_SECS")
+                .unwrap_or_else(|_| "5".to_string())
+                .parse()?,
+            longpoll_max_reconnect_attempts: env::var("LONGPOLL_MAX_RECONNECT_ATTEMPTS")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()?,
+            longpoll_backoff_multiplier: env::var("LONGPOLL_BACKOFF_MULTIPLIER")
+                .unwrap_or_else(|_| "1.5".to_string())
+                .parse()?,
+            longpoll_max_wait_secs: env::var("LONGPOLL_MAX_WAIT_SECS")
+                .unwrap_or_else(|_| "300".to_string())
                 .parse()?,
             claude_api_url: env::var("CLAUDE_API_URL")
                 .unwrap_or_else(|_| "https://api.tokenator.cloud/v1".to_string()),

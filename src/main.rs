@@ -3,16 +3,18 @@ mod config;
 mod context;
 mod db;
 mod logger;
+mod longpoll_manager;
 mod openvk;
 mod web;
 
 use ai::ClaudeAI;
 use anyhow::Result;
-use config::Config;
+use config::{Config, BotMode};
 use context::{ContextManager, MentionDetector};
 use db::Database;
 use log::{error, info};
-use openvk::OpenVKClient;
+use longpoll_manager::LongPollManager;
+use openvk::{OpenVKClient, ParsedNotification};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -27,6 +29,7 @@ async fn main() -> Result<()> {
     logger::init_logger_dual(&config.log_file_path, &config.log_level, config.log_console)?;
 
     info!("НейроРаб bot starting...");
+    info!("Bot mode: {:?}", config.bot_mode);
     info!("Configuration loaded successfully");
 
     // Initialize database
@@ -34,7 +37,11 @@ async fn main() -> Result<()> {
     info!("Database initialized");
 
     // Initialize API clients
-    let openvk_client = OpenVKClient::new(config.openvk_api_url.clone(), config.openvk_api_token.clone(), config.openvk_hide_online_activity);
+    let openvk_client = Arc::new(OpenVKClient::new(
+        config.openvk_api_url.clone(),
+        config.openvk_api_token.clone(),
+        config.openvk_hide_online_activity,
+    ));
     let claude_ai = ClaudeAI::new(
         config.claude_api_url.clone(),
         config.claude_api_key.clone(),
@@ -46,19 +53,62 @@ async fn main() -> Result<()> {
 
     info!("All clients initialized");
 
-    // Bot state variables
+    // Choose bot mode and run
+    match config.bot_mode {
+        BotMode::Wall => {
+            info!("Running in Wall polling mode");
+            run_wall_polling(
+                openvk_client.as_ref(),
+                &claude_ai,
+                &search_engine,
+                &scraper,
+                &context_manager,
+                &db,
+                &config,
+            )
+            .await?
+        }
+        BotMode::Global => {
+            info!("Running in Global LongPoll mode");
+            run_longpoll_listener(
+                openvk_client.clone(),
+                &claude_ai,
+                &search_engine,
+                &scraper,
+                &context_manager,
+                &db,
+                &config,
+            )
+            .await?
+        }
+    }
+
+    Ok(())
+}
+
+/// Run bot in wall polling mode (legacy mode)
+async fn run_wall_polling(
+    openvk_client: &OpenVKClient,
+    claude_ai: &ClaudeAI,
+    search_engine: &DuckDuckGoSearch,
+    scraper: &WebScraper,
+    context_manager: &ContextManager,
+    db: &Arc<Database>,
+    config: &Config,
+) -> Result<()> {
+    info!("Starting wall polling mode");
     let mut last_post_offset = 0u32;
     let polling_interval = Duration::from_secs(config.polling_interval_secs);
 
     loop {
         match run_poll_iteration(
-            &openvk_client,
-            &claude_ai,
-            &search_engine,
-            &scraper,
-            &context_manager,
-            &db,
-            &config,
+            openvk_client,
+            claude_ai,
+            search_engine,
+            scraper,
+            context_manager,
+            db,
+            config,
             &mut last_post_offset,
         )
         .await
@@ -71,6 +121,155 @@ async fn main() -> Result<()> {
 
         sleep(polling_interval).await;
     }
+}
+
+/// Run bot in global LongPoll mode
+async fn run_longpoll_listener(
+    openvk_client: Arc<OpenVKClient>,
+    claude_ai: &ClaudeAI,
+    search_engine: &DuckDuckGoSearch,
+    scraper: &WebScraper,
+    context_manager: &ContextManager,
+    db: &Arc<Database>,
+    config: &Config,
+) -> Result<()> {
+    info!("Starting global LongPoll listener mode");
+    let mut lp_manager = LongPollManager::new(openvk_client.clone(), config.clone());
+
+    // Clone data for use in the event handler closure
+    let openvk_client_clone = openvk_client.clone();
+    let claude_ai_clone = claude_ai.clone();
+    let search_engine_clone = search_engine.clone();
+    let scraper_clone = scraper.clone();
+    let context_manager_clone = context_manager.clone();
+    let db_clone = db.clone();
+    let config_clone = config.clone();
+
+    lp_manager
+        .run_with_reconnect(move |notification: ParsedNotification| {
+            let openvk = openvk_client_clone.clone();
+            let ai = claude_ai_clone.clone();
+            let search = search_engine_clone;
+            let scraper_inner = scraper_clone;
+            let ctx_mgr = context_manager_clone;
+            let database = db_clone.clone();
+            let cfg = config_clone.clone();
+
+            async move {
+                handle_longpoll_notification(
+                    notification,
+                    openvk.as_ref(),
+                    &ai,
+                    &search,
+                    &scraper_inner,
+                    &ctx_mgr,
+                    &database,
+                    &cfg,
+                )
+                .await
+            }
+        })
+        .await
+}
+
+/// Handle a single LongPoll notification
+async fn handle_longpoll_notification(
+    notification: ParsedNotification,
+    openvk_client: &OpenVKClient,
+    claude_ai: &ClaudeAI,
+    search_engine: &DuckDuckGoSearch,
+    scraper: &WebScraper,
+    context_manager: &ContextManager,
+    db: &Arc<Database>,
+    config: &Config,
+) -> Result<()> {
+    info!(
+        "Handling LongPoll notification: event_type={:?}, wall_owner={}, post_id={}, comment_id={}",
+        notification.event_type, notification.wall_owner_id, notification.post_id, notification.comment_id
+    );
+
+    // Check if comment has already been processed
+    if db.is_comment_processed(notification.comment_id)? {
+        info!("Comment {} already processed, skipping", notification.comment_id);
+        return Ok(());
+    }
+
+    // Fetch the full comment to get author info
+    let comments = openvk_client
+        .wall_get_comments(notification.wall_owner_id, notification.post_id, 100, 0)
+        .await?;
+
+    let comment = match comments.iter().find(|c| c.id == notification.comment_id) {
+        Some(c) => c,
+        None => {
+            error!(
+                "Could not find comment {} in post {}_{}",
+                notification.comment_id, notification.wall_owner_id, notification.post_id
+            );
+            return Ok(());
+        }
+    };
+
+    info!(
+        "Processing comment {} from user {} - content: {}",
+        comment.id, comment.author_id, comment.text
+    );
+
+    // Add comment to context
+    context_manager
+        .add_comment_context(
+            notification.wall_owner_id,
+            notification.post_id,
+            comment.author_id,
+            comment.author_id.to_string(),
+            comment.text.clone(),
+        )
+        .await?;
+
+    // Generate AI response
+    match generate_bot_response(
+        comment,
+        claude_ai,
+        search_engine,
+        scraper,
+        context_manager,
+        config,
+        notification.wall_owner_id,
+        notification.post_id,
+    )
+    .await
+    {
+        Ok(response) => {
+            // Post the response
+            if let Err(e) = openvk_client
+                .wall_create_comment_reply(
+                    notification.wall_owner_id,
+                    notification.post_id,
+                    comment.id,
+                    response.clone(),
+                )
+                .await
+            {
+                error!("Failed to post bot response: {}", e);
+            } else {
+                info!("Successfully posted bot response to comment {}", comment.id);
+
+                // Store processed comment in database
+                db.add_processed_comment(&db::ProcessedComment {
+                    comment_id: comment.id,
+                    wall_owner_id: notification.wall_owner_id,
+                    comment_text: comment.text.clone(),
+                    bot_response: response,
+                    processed_at: chrono::Utc::now().to_rfc3339(),
+                })?;
+            }
+        }
+        Err(e) => {
+            error!("Failed to generate bot response: {}", e);
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_poll_iteration(

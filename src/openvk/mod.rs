@@ -88,3 +88,59 @@ pub struct ApiError {
     pub error_msg: String,
     pub request_params: Option<Vec<RequestParam>>,
 }
+
+// LongPoll Support Structures
+
+/// LongPoll Server Information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LongPollServerResponse {
+    pub response: Option<LongPollServerData>,
+    pub error: Option<ApiError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LongPollServerData {
+    pub key: String,
+    pub server: String,
+    pub ts: u64,
+}
+
+/// LongPoll Event from server
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LongPollEvent {
+    // Update type and ts
+    Updates(Vec<serde_json::Value>),
+}
+
+/// Notification types in LongPoll events
+/// Event codes:
+/// 8 = reply_added (comment on user's comment)
+/// 9 = wall_mention (mention in post/comment)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EventType {
+    CommentReply = 8,
+    Mention = 9,
+}
+
+impl EventType {
+    pub fn from_code(code: u32) -> Option<Self> {
+        match code {
+            8 => Some(EventType::CommentReply),
+            9 => Some(EventType::Mention),
+            _ => None,
+        }
+    }
+}
+
+/// Parsed notification from LongPoll event
+#[derive(Debug, Clone)]
+pub struct ParsedNotification {
+    pub event_type: EventType,
+    pub wall_owner_id: i64,
+    pub post_id: u64,
+    pub comment_id: u64,
+    pub from_id: i64,
+    pub text: String,
+    pub timestamp: u64,
+}
