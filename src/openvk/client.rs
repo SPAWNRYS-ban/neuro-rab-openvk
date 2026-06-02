@@ -119,7 +119,7 @@ impl OpenVKClient {
             .query(&[
                 ("owner_id", owner_id.to_string()),
                 ("post_id", post_id.to_string()),
-                ("text", text.clone()),
+                ("message", text.clone()),
                 ("access_token", self.api_token.clone()),
             ])
             .send()
@@ -162,7 +162,7 @@ impl OpenVKClient {
                 ("owner_id", owner_id.to_string()),
                 ("post_id", post_id.to_string()),
                 ("reply_to_comment", reply_to_comment.to_string()),
-                ("text", text.clone()),
+                ("message", text.clone()),
                 ("access_token", self.api_token.clone()),
             ])
             .send()
