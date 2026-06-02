@@ -34,7 +34,7 @@ async fn main() -> Result<()> {
     info!("Database initialized");
 
     // Initialize API clients
-    let openvk_client = OpenVKClient::new(config.openvk_api_url.clone(), config.openvk_api_token.clone());
+    let openvk_client = OpenVKClient::new(config.openvk_api_url.clone(), config.openvk_api_token.clone(), config.openvk_hide_online_activity);
     let claude_ai = ClaudeAI::new(
         config.claude_api_url.clone(),
         config.claude_api_key.clone(),

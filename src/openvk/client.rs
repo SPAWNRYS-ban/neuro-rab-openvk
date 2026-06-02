@@ -9,14 +9,16 @@ pub struct OpenVKClient {
     client: Client,
     api_url: String,
     api_token: String,
+    hide_online_activity: bool,
 }
 
 impl OpenVKClient {
-    pub fn new(api_url: String, api_token: String) -> Self {
+    pub fn new(api_url: String, api_token: String, hide_online_activity: u32) -> Self {
         OpenVKClient {
             client: Client::new(),
             api_url,
             api_token,
+            hide_online_activity: hide_online_activity != 0,
         }
     }
 
@@ -31,15 +33,27 @@ impl OpenVKClient {
 
         debug!("Fetching wall posts from {}", url);
 
+        let mut query_params = vec![
+            ("owner_id", owner_id.to_string()),
+            ("count", count.to_string()),
+            ("offset", offset.to_string()),
+            ("access_token", self.api_token.clone()),
+        ];
+
+        let hide_online = if self.hide_online_activity {
+            Some(("forGodSakePleaseDoNotReportAboutMyOnlineActivity", "1".to_string()))
+        } else {
+            None
+        };
+
+        if let Some(param) = hide_online {
+            query_params.push(param);
+        }
+
         let response = self
             .client
             .get(&url)
-            .query(&[
-                ("owner_id", owner_id.to_string()),
-                ("count", count.to_string()),
-                ("offset", offset.to_string()),
-                ("access_token", self.api_token.clone()),
-            ])
+            .query(&query_params)
             .send()
             .await?;
 
@@ -73,17 +87,29 @@ impl OpenVKClient {
             owner_id, post_id, url
         );
 
+        let mut query_params = vec![
+            ("owner_id", owner_id.to_string()),
+            ("post_id", post_id.to_string()),
+            ("count", count.to_string()),
+            ("offset", offset.to_string()),
+            ("access_token", self.api_token.clone()),
+            ("extended", "1".to_string()),
+        ];
+
+        let hide_online = if self.hide_online_activity {
+            Some(("forGodSakePleaseDoNotReportAboutMyOnlineActivity", "1".to_string()))
+        } else {
+            None
+        };
+
+        if let Some(param) = hide_online {
+            query_params.push(param);
+        }
+
         let response = self
             .client
             .get(&url)
-            .query(&[
-                ("owner_id", owner_id.to_string()),
-                ("post_id", post_id.to_string()),
-                ("count", count.to_string()),
-                ("offset", offset.to_string()),
-                ("access_token", self.api_token.clone()),
-                ("extended", "1".to_string()),
-            ])
+            .query(&query_params)
             .send()
             .await?;
 
@@ -113,15 +139,27 @@ impl OpenVKClient {
 
         debug!("Creating comment on post {}_{}", owner_id, post_id);
 
+        let mut query_params = vec![
+            ("owner_id", owner_id.to_string()),
+            ("post_id", post_id.to_string()),
+            ("message", text.clone()),
+            ("access_token", self.api_token.clone()),
+        ];
+
+        let hide_online = if self.hide_online_activity {
+            Some(("forGodSakePleaseDoNotReportAboutMyOnlineActivity", "1".to_string()))
+        } else {
+            None
+        };
+
+        if let Some(param) = hide_online {
+            query_params.push(param);
+        }
+
         let response = self
             .client
             .post(&url)
-            .query(&[
-                ("owner_id", owner_id.to_string()),
-                ("post_id", post_id.to_string()),
-                ("message", text.clone()),
-                ("access_token", self.api_token.clone()),
-            ])
+            .query(&query_params)
             .send()
             .await?;
 
@@ -155,16 +193,28 @@ impl OpenVKClient {
             reply_to_comment, owner_id, post_id
         );
 
+        let mut query_params = vec![
+            ("owner_id", owner_id.to_string()),
+            ("post_id", post_id.to_string()),
+            ("reply_to_comment", reply_to_comment.to_string()),
+            ("message", text.clone()),
+            ("access_token", self.api_token.clone()),
+        ];
+
+        let hide_online = if self.hide_online_activity {
+            Some(("forGodSakePleaseDoNotReportAboutMyOnlineActivity", "1".to_string()))
+        } else {
+            None
+        };
+
+        if let Some(param) = hide_online {
+            query_params.push(param);
+        }
+
         let response = self
             .client
             .post(&url)
-            .query(&[
-                ("owner_id", owner_id.to_string()),
-                ("post_id", post_id.to_string()),
-                ("reply_to_comment", reply_to_comment.to_string()),
-                ("message", text.clone()),
-                ("access_token", self.api_token.clone()),
-            ])
+            .query(&query_params)
             .send()
             .await?;
 

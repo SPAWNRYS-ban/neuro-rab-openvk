@@ -6,6 +6,7 @@ pub struct Config {
     pub openvk_api_url: String,
     pub openvk_api_token: String,
     pub openvk_bot_id: u64,
+    pub openvk_hide_online_activity: u32,
     pub claude_api_url: String,
     pub claude_api_key: String,
     pub claude_model: String,
@@ -32,6 +33,9 @@ impl Config {
             openvk_api_token: env::var("OPENVK_API_TOKEN")?,
             openvk_bot_id: env::var("OPENVK_BOT_ID")
                 .unwrap_or_else(|_| "1".to_string())
+                .parse()?,
+            openvk_hide_online_activity: env::var("OPENVK_HIDE_ONLINE_ACTIVITY")
+                .unwrap_or_else(|_| "0".to_string())
                 .parse()?,
             claude_api_url: env::var("CLAUDE_API_URL")
                 .unwrap_or_else(|_| "https://api.tokenator.cloud/v1".to_string()),
