@@ -73,7 +73,10 @@ impl LongPollManager {
         let mut listen_cycle = 0;
         loop {
             listen_cycle += 1;
-            info!("🔄 LongPoll listen cycle #{}", listen_cycle);
+            // Only log first cycle and every 50th cycle to avoid spam
+            if listen_cycle == 1 || listen_cycle % 50 == 0 {
+                info!("🔄 LongPoll listen cycle #{}", listen_cycle);
+            }
             
             match self
                 .openvk_client

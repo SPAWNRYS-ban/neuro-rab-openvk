@@ -1,6 +1,32 @@
 use anyhow::Result;
 use std::fs;
+use std::io::{self, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+/// Combined writer that writes to both stdout and file
+#[derive(Clone)]
+struct DualWriter {
+    file: Arc<Mutex<fs::File>>,
+}
+
+impl Write for DualWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Write to stderr (console)
+        let _ = io::stderr().write_all(buf);
+        
+        // Write to file
+        let mut file = self.file.lock().unwrap();
+        file.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let _ = io::stderr().flush();
+        let mut file = self.file.lock().unwrap();
+        file.flush()
+    }
+}
 
 pub fn init_logger_dual(
     log_file_path: &str,
@@ -25,12 +51,15 @@ pub fn init_logger_dual(
     };
 
     if use_console {
-        // Log to both file and console
+        // Log to BOTH file and console (dual logging)
         let file = fs::File::create(log_file_path)?;
+        let dual_writer = DualWriter {
+            file: Arc::new(Mutex::new(file)),
+        };
         
-        // Use a simple approach: log to stdout (console)
         let subscriber = tracing_subscriber::fmt()
             .with_env_filter(env_filter)
+            .with_writer(move || dual_writer.clone())
             .with_ansi(true)
             .with_target(true)
             .with_line_number(true)
@@ -38,7 +67,7 @@ pub fn init_logger_dual(
             .finish();
 
         tracing::subscriber::set_global_default(subscriber)?;
-        eprintln!("🤖 НейροРаб: Логирование в консоль включено");
+        eprintln!("🤖 НейроРаб: Логирование в консоль и файл включено (DUAL MODE)");
     } else {
         // Log only to file
         let file = fs::File::create(log_file_path)?;

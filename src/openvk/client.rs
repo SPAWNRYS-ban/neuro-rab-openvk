@@ -364,8 +364,11 @@ impl OpenVKClient {
             .as_u64()
             .ok_or_else(|| anyhow!("Event code is not u64"))? as u32;
 
+        // Log ALL event codes for debugging (this is critical!)
+        tracing::debug!("🔍 Received raw event code: {} (full event: {})", event_code, serde_json::to_string(event).unwrap_or_default());
+
         let event_type =
-            EventType::from_code(event_code).ok_or_else(|| anyhow!("Unknown event code: {}", event_code))?;
+            EventType::from_code(event_code).ok_or_else(|| anyhow!("Unknown event code: {} | This may be a new OpenVK event type that bot doesn't support yet", event_code))?;
 
         let object_id = event_array[1]
             .as_i64()
