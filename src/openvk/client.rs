@@ -27,7 +27,7 @@ impl OpenVKClient {
         count: u32,
         offset: u32,
     ) -> Result<Vec<Post>> {
-        let url = format!("{}/wall.get", self.api_url);
+        let url = format!("{}/method/wall.get", self.api_url);
 
         debug!("Fetching wall posts from {}", url);
 
@@ -66,7 +66,7 @@ impl OpenVKClient {
         count: u32,
         offset: u32,
     ) -> Result<Vec<Comment>> {
-        let url = format!("{}/wall.getComments", self.api_url);
+        let url = format!("{}/method/wall.getComments", self.api_url);
 
         debug!(
             "Fetching comments for post {}_{} from {}",
@@ -109,7 +109,7 @@ impl OpenVKClient {
         post_id: u64,
         text: String,
     ) -> Result<u64> {
-        let url = format!("{}/wall.createComment", self.api_url);
+        let url = format!("{}/method/wall.createComment", self.api_url);
 
         debug!("Creating comment on post {}_{}", owner_id, post_id);
 
@@ -148,7 +148,7 @@ impl OpenVKClient {
         reply_to_comment: u64,
         text: String,
     ) -> Result<u64> {
-        let url = format!("{}/wall.createComment", self.api_url);
+        let url = format!("{}/method/wall.createComment", self.api_url);
 
         debug!(
             "Creating reply to comment {} on post {}_{}\n",

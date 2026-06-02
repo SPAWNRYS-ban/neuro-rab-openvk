@@ -22,11 +22,56 @@
 - Claude API key (через tokenator.cloud)
 - SQLite3
 
-## 🛠️ Установка и配置
+## 🛠️ Установка и конфигурация
+
+### 1. Получение OpenVK API токена
+
+Для получения токена OpenVK API используйте одно из двух методов:
+
+#### **Способ 1: Password Authorization (рекомендуемый для ботов)**
+
+Отправьте запрос на эндпоинт `/token` вашего OpenVK экземпляра:
+
+```bash
+curl "http://your-openvk-instance.com/token?username=YOUR_USERNAME&password=YOUR_PASSWORD&grant_type=password"
+```
+
+Ответ будет содержать `access_token`:
+
+```json
+{
+    "access_token": "YOUR_TOKEN_HERE",
+    "expires_in": 0,
+    "user_id": 123
+}
+```
+
+Опционально можно указать `client_name` для идентификации приложения бота:
+
+```bash
+curl "http://your-openvk-instance.com/token?username=YOUR_USERNAME&password=YOUR_PASSWORD&grant_type=password&client_name=НейроРаб"
+```
+
+**Если включена двухфакторная аутентификация**, добавьте параметр `code`:
+
+```bash
+curl "http://your-openvk-instance.com/token?username=YOUR_USERNAME&password=YOUR_PASSWORD&grant_type=password&code=YOUR_2FA_CODE"
+```
+
+#### **Способ 2: OAuth Flow**
+
+Если предпочитаете OAuth, используйте эндпоинт `/authorize`:
+
+```
+http://your-openvk-instance.com/authorize?client_name=НейроРаб&redirect_uri=https://oauth.vk.com/blank.html&display=page&response_type=token
+```
+
+### 2. Установка
 
 1. **Клонируйте репозиторий**:
 ```bash
-cd /home/spawnrys/neuro-rab-openvk
+git clone https://github.com/SPAWNRYS-ban/neuro-rab-openvk.git
+cd neuro-rab-openvk
 ```
 
 2. **Скопируйте и отредактируйте конфигурацию**:
