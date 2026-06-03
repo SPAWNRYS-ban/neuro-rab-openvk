@@ -42,6 +42,7 @@ pub struct Config {
     pub bot_mention_prefix: String,
     pub bot_name: String,
     pub context_memory_size: usize,
+    pub notif_poll_interval_secs: u64,
 }
 
 impl Config {
@@ -101,6 +102,9 @@ impl Config {
                 .unwrap_or_else(|_| "@НейроРаб".to_string()),
             bot_name: env::var("BOT_NAME").unwrap_or_else(|_| "НейроРаб".to_string()),
             context_memory_size: env::var("CONTEXT_MEMORY_SIZE")
+                .unwrap_or_else(|_| "10".to_string())
+                .parse()?,
+            notif_poll_interval_secs: env::var("NOTIF_POLL_INTERVAL_SECS")
                 .unwrap_or_else(|_| "10".to_string())
                 .parse()?,
         })

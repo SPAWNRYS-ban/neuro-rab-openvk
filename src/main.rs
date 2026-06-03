@@ -30,6 +30,43 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }
 
+/// Compute a STABLE deduplication id for a notification.
+///
+/// We only handle `mention` (post the bot was tagged in) and `comment_post`
+/// (a comment under a post). The id is derived from the triggering object id
+/// (`feedback.id`) and NAMESPACED by kind so a post id and a comment id can
+/// never collide. We must NOT mix in `notif.date`, because OpenVK returns the
+/// SAME mention multiple times with DIFFERENT dates.
+///
+/// Returns `None` for notification kinds we don't act on.
+fn notification_dedup_id(notif: &Notification) -> Option<u64> {
+    let ntype = notif.notification_type.as_deref().unwrap_or("");
+    let is_mention = ntype == "mention";
+    let is_comment_post = ntype == "comment_post";
+    if !is_mention && !is_comment_post {
+        return None;
+    }
+
+    let post_obj = if is_mention {
+        notif.feedback.as_ref()
+    } else {
+        notif.parent.as_ref()
+    }?;
+    let post_id = post_obj.id? as u64;
+
+    let trigger_id = notif
+        .feedback
+        .as_ref()
+        .and_then(|f| f.id)
+        .unwrap_or(post_id as i64) as u64;
+
+    Some(if is_mention {
+        trigger_id.wrapping_mul(10).wrapping_add(1)
+    } else {
+        trigger_id.wrapping_mul(10).wrapping_add(2)
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
 
@@ -156,22 +193,44 @@ async fn run_longpoll_listener(
 ) -> Result<()> {
     info!("Starting global mode (LongPoll DMs + Notifications mentions/comments)");
 
-    // Record the bot's startup time (unix epoch). We only respond to
-    // notifications (mentions/comments) that arrive AFTER this moment, so the
-    // bot doesn't flood-reply to every old mention sitting in the feed when it
-    // (re)starts.
-    let started_at: u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    info!("Notification cutoff: only replying to events after {}", started_at);
-
     // Initialize the LongPoll server data (gives us the starting `ts`).
     let mut server_data = openvk_client.messages_get_longpoll_server().await?;
 
+    // SEED already-existing notifications as "processed" on startup.
+    //
+    // Instead of comparing a notification's timestamp against the bot's start
+    // time (FRAGILE — any clock skew between the OpenVK server and the host
+    // would make valid NEW notifications look "old" and be dropped, which was
+    // the main cause of the bot missing replies), we determine "freshness"
+    // purely from our LOCAL database. On startup we mark every notification that
+    // ALREADY exists in the feed as processed, so the bot won't flood-reply to a
+    // backlog after a (re)start, but WILL answer anything that arrives later.
+    match openvk_client.notifications_get(50).await {
+        Ok(existing) => {
+            let mut seeded = 0u32;
+            for notif in &existing {
+                if let Some(dedup_id) = notification_dedup_id(notif) {
+                    if !db.is_comment_processed(dedup_id).unwrap_or(false) {
+                        let _ = db.add_processed_comment(&db::ProcessedComment {
+                            comment_id: dedup_id,
+                            wall_owner_id: 0,
+                            comment_text: "[seeded on startup]".to_string(),
+                            bot_response: String::new(),
+                            processed_at: chrono::Utc::now().to_rfc3339(),
+                        });
+                        seeded += 1;
+                    }
+                }
+            }
+            info!("Seeded {} existing notifications as processed on startup", seeded);
+            // Clear the unread badge in the web UI for the startup backlog.
+            let _ = openvk_client.notifications_mark_as_viewed().await;
+        }
+        Err(e) => error!("Failed to seed notifications on startup: {}", e),
+    }
 
     // Throttle the notifications poll so we don't hit the API every cycle.
-    let notif_interval = Duration::from_secs(10);
+    let notif_interval = Duration::from_secs(config.notif_poll_interval_secs);
     let mut last_notif_poll = std::time::Instant::now()
         .checked_sub(notif_interval)
         .unwrap_or_else(std::time::Instant::now);
@@ -211,8 +270,9 @@ async fn run_longpoll_listener(
             last_notif_poll = std::time::Instant::now();
             match openvk_client.notifications_get(20).await {
                 Ok(notifs) => {
+                    let mut handled_any = false;
                     for notif in &notifs {
-                        if let Err(e) = handle_notification(
+                        match handle_notification(
                             notif,
                             openvk_client.as_ref(),
                             claude_ai,
@@ -221,14 +281,20 @@ async fn run_longpoll_listener(
                             context_manager,
                             db,
                             config,
-                            started_at,
                         )
                         .await
                         {
-                            error!("Error handling notification: {}", e);
+                            Ok(did_handle) => handled_any |= did_handle,
+                            Err(e) => error!("Error handling notification: {}", e),
                         }
                     }
 
+                    // After processing a fresh batch, clear the web UI unread
+                    // badge. The authoritative "already handled" state lives in
+                    // our DB, so this is purely cosmetic and best-effort.
+                    if handled_any {
+                        let _ = openvk_client.notifications_mark_as_viewed().await;
+                    }
                 }
                 Err(e) => error!("notifications.get error: {}", e),
             }
@@ -247,6 +313,11 @@ async fn run_longpoll_listener(
 ///
 /// We respond by posting a comment (or reply) on the post, and we load the
 /// whole comment thread into context first so the bot knows the conversation.
+///
+/// Returns `Ok(true)` if the bot actually posted a reply for this notification
+/// (used by the caller to decide whether to mark notifications as viewed),
+/// `Ok(false)` if the notification was skipped (wrong type, already processed,
+/// no real mention, etc.).
 async fn handle_notification(
     notif: &Notification,
     openvk_client: &OpenVKClient,
@@ -256,24 +327,21 @@ async fn handle_notification(
     context_manager: &ContextManager,
     db: &Arc<Database>,
     config: &Config,
-    started_at: u64,
-) -> Result<()> {
+) -> Result<bool> {
     let ntype = notif.notification_type.as_deref().unwrap_or("");
 
     // We only care about mentions in posts and comments on posts.
     let is_mention = ntype == "mention";
     let is_comment_post = ntype == "comment_post";
     if !is_mention && !is_comment_post {
-        return Ok(());
+        return Ok(false);
     }
 
-    // Skip notifications that happened BEFORE the bot started, so we don't
-    // flood-reply to a backlog of old mentions on (re)start.
-    let notif_date = notif.date.unwrap_or(0);
-    if notif_date < started_at {
-        return Ok(());
-    }
-
+    // NOTE: We deliberately do NOT filter by a timestamp cutoff anymore. Clock
+    // skew between the OpenVK server and this host made valid NEW notifications
+    // look "old" and get dropped. Freshness is now decided purely by our local
+    // database (the dedup id below): if we've already handled it, skip it;
+    // otherwise it's new. Old backlog is seeded as processed on startup.
 
     // Determine the POST object (where to comment) and the text/author that
     // triggered the notification.
@@ -289,7 +357,7 @@ async fn handle_notification(
         Some(p) => p,
         None => {
             info!("Notification ({}) has no post object, skipping", ntype);
-            return Ok(());
+            return Ok(false);
         }
     };
 
@@ -298,7 +366,7 @@ async fn handle_notification(
         Some(id) => id as u64,
         None => {
             info!("Notification ({}) post has no id, skipping", ntype);
-            return Ok(());
+            return Ok(false);
         }
     };
     let owner_id = post_obj.to_id.or(post_obj.owner_id).unwrap_or(0);
@@ -310,11 +378,19 @@ async fn handle_notification(
         .and_then(|f| f.from_id.or(f.owner_id))
         .unwrap_or(owner_id);
 
-    // For comment_post we only respond if the bot is actually mentioned.
+    // For comment_post we only respond if the bot is ACTUALLY mentioned.
+    // This now recognizes BOTH the textual prefix (@НейроРаб / НейроРаб) AND
+    // the real OpenVK mention tag [id{bot_id}|...] the platform inserts when
+    // you tag the bot from the UI (previously only the textual prefix matched,
+    // so real tags were ignored and the bot stayed silent).
     if is_comment_post
-        && !MentionDetector::contains_mention(&trigger_text, &config.bot_mention_prefix)
+        && !MentionDetector::contains_mention_for_bot(
+            &trigger_text,
+            &config.bot_mention_prefix,
+            config.openvk_bot_id,
+        )
     {
-        return Ok(());
+        return Ok(false);
     }
 
     // Deduplicate using a STABLE key derived from the triggering object id
@@ -332,7 +408,7 @@ async fn handle_notification(
         trigger_id.wrapping_mul(10).wrapping_add(2)
     };
     if db.is_comment_processed(dedup_id)? {
-        return Ok(());
+        return Ok(false);
     }
 
 
@@ -343,7 +419,9 @@ async fn handle_notification(
     );
 
 
-    // Load the whole comment thread into context so the bot knows the conversation.
+    // Load the whole comment thread into context so the bot knows the
+    // conversation. This is best-effort: a failure here (e.g. the virtual
+    // mention post returns no comments) must NOT prevent the bot from replying.
     if let Ok(comments) = openvk_client.wall_get_comments(owner_id, post_id, 100, 0).await {
         for c in &comments {
             context_manager
@@ -416,6 +494,7 @@ async fn handle_notification(
                         bot_response: response,
                         processed_at: chrono::Utc::now().to_rfc3339(),
                     })?;
+                    return Ok(true);
                 }
                 Err(e) => error!("Failed to post comment response: {}", e),
             }
@@ -423,7 +502,7 @@ async fn handle_notification(
         Err(e) => error!("Failed to generate response for {}: {}", ntype, e),
     }
 
-    Ok(())
+    Ok(false)
 }
 
 
@@ -629,8 +708,12 @@ async fn process_post(
             continue;
         }
 
-        // Check if bot is mentioned
-        if !MentionDetector::contains_mention(&comment.text, &config.bot_mention_prefix) {
+        // Check if bot is mentioned (textual prefix OR real [id..] tag).
+        if !MentionDetector::contains_mention_for_bot(
+            &comment.text,
+            &config.bot_mention_prefix,
+            config.openvk_bot_id,
+        ) {
             continue;
         }
 

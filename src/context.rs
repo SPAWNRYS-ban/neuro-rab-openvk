@@ -102,6 +102,48 @@ impl MentionDetector {
         text.contains(mention) || text.contains(&mention.replace("@", ""))
     }
 
+    /// Detect whether the bot is mentioned, considering BOTH:
+    ///   1. The textual prefix (e.g. "@НейроРаб" / "НейроРаб"), AND
+    ///   2. The REAL OpenVK mention tag the platform inserts when you tag a
+    ///      user: `[id{bot_id}|Display Name]` or `[id{bot_id}]`.
+    ///
+    /// Previously the bot only matched the textual prefix, so a real tag (which
+    /// does NOT contain the literal "@НейроРаб" string) was never recognized and
+    /// the bot stayed silent. This method fixes that.
+    pub fn contains_mention_for_bot(text: &str, mention: &str, bot_id: u64) -> bool {
+        // 1. Textual prefix match (case-insensitive on the un-@ name).
+        let name = mention.replace('@', "");
+        let lower = text.to_lowercase();
+        if text.contains(mention)
+            || (!name.is_empty() && lower.contains(&name.to_lowercase()))
+        {
+            return true;
+        }
+
+        // 2. Real OpenVK mention tag: [id{bot_id}|...] or [id{bot_id}]
+        let tag_prefix = format!("[id{}", bot_id);
+        if let Some(pos) = text.find(&tag_prefix) {
+            // Make sure the character right after the id is a delimiter
+            // (`|` or `]`), so `[id4134` doesn't match `[id41343...]`.
+            let after = &text[pos + tag_prefix.len()..];
+            if after.starts_with('|') || after.starts_with(']') {
+                return true;
+            }
+        }
+
+        // OpenVK also supports club mentions as [club{id}|...]; include for
+        // completeness in case the bot is run as a group.
+        let club_prefix = format!("[club{}", bot_id);
+        if let Some(pos) = text.find(&club_prefix) {
+            let after = &text[pos + club_prefix.len()..];
+            if after.starts_with('|') || after.starts_with(']') {
+                return true;
+            }
+        }
+
+        false
+    }
+
     pub fn extract_mention_context(text: &str, mention: &str) -> String {
         // Find the position of mention
         if let Some(pos) = text.find(mention) {

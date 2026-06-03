@@ -511,6 +511,32 @@ impl OpenVKClient {
         Ok(data.items)
     }
 
+    /// Mark all notifications as viewed (best-effort).
+    ///
+    /// IMPORTANT: OpenVK (like VK) has NO API to mark a SINGLE notification as
+    /// read — `notifications.markAsViewed` resets the WHOLE unread counter at
+    /// once. So this is only used to keep the web UI's notification badge clean
+    /// AFTER we've finished processing a batch. The authoritative "already
+    /// handled" state lives in our local database (processed_comments), NOT in
+    /// this call. We therefore ignore any error here.
+    pub async fn notifications_mark_as_viewed(&self) -> Result<()> {
+        let url = format!("{}/method/notifications.markAsViewed", self.api_url);
+
+        let mut query_params = vec![("access_token", self.api_token.clone())];
+
+        if self.hide_online_activity {
+            query_params.push((
+                "forGodSakePleaseDoNotReportAboutMyOnlineActivity",
+                "1".to_string(),
+            ));
+        }
+
+        let response = self.client.get(&url).query(&query_params).send().await?;
+        let body = response.text().await.unwrap_or_default();
+        debug!("notifications.markAsViewed response: {}", body);
+        Ok(())
+    }
+
     /// Parse a single LongPoll event to get notification details
     /// OpenVK LongPoll event type 4 (NewMessage) format:
     /// [4, messageId, spam_flag, peer_id, timestamp, text, info, attachments, random_id, conversation_id, edited]
