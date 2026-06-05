@@ -11,29 +11,46 @@ use tracing::{debug, warn};
 pub fn extract_image_urls_from_attachments(attachments: &[Value]) -> Vec<String> {
     let mut urls = Vec::new();
 
-    for attachment in attachments {
+    debug!("🔍 extract_image_urls_from_attachments called with {} attachments", attachments.len());
+
+    for (idx, attachment) in attachments.iter().enumerate() {
+        debug!("  Attachment #{}: {}", idx, serde_json::to_string_pretty(attachment).unwrap_or_default());
+        
         let att_type = attachment
             .get("type")
             .and_then(|t| t.as_str())
             .unwrap_or("");
 
+        debug!("    Type: '{}'", att_type);
+
         // Handle photo attachments
         if att_type == "photo" {
             if let Some(photo) = attachment.get("photo") {
+                debug!("    Has 'photo' field");
                 // Try to extract the largest image from sizes array
                 if let Some(sizes) = photo.get("sizes").and_then(|s| s.as_array()) {
+                    debug!("    Has 'sizes' array with {} items", sizes.len());
                     // Find the largest size (usually last or with highest width)
                     if let Some(largest) = sizes.last() {
-                        if let Some(src) = largest.get("src").and_then(|s| s.as_str()) {
+                        if let Some(src) = largest.get("url").and_then(|s| s.as_str()) {
                             urls.push(src.to_string());
-                            debug!("Extracted photo URL from attachment: {}", truncate_url(src));
+                            debug!("    ✅ Extracted photo URL: {}", truncate_url(src));
+                        } else {
+                            debug!("    ❌ No 'url' in largest size");
                         }
                     }
+                } else {
+                    debug!("    ❌ No 'sizes' array found");
                 }
+            } else {
+                debug!("    ❌ No 'photo' field found");
             }
+        } else {
+            debug!("    ⏭️  Skipping non-photo type: '{}'", att_type);
         }
     }
 
+    debug!("🔍 extract_image_urls_from_attachments: Found {} URLs total", urls.len());
     urls
 }
 

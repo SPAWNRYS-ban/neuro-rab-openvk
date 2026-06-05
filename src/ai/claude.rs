@@ -77,6 +77,17 @@ impl ClaudeAI {
             messages: full_messages,
         };
 
+        // DEBUG: Log request info (but not full JSON if it contains images, as base64 data is too large)
+        let has_images = request.messages.iter().any(|msg| {
+            matches!(&msg.content, MessageContent::Rich(_))
+        });
+        
+        if has_images {
+            debug!("📤 Claude API request with Rich Content (images) - not logging full JSON to avoid log spam");
+        } else if let Ok(json_str) = serde_json::to_string_pretty(&request) {
+            debug!("📤 Full Claude API request JSON:\n{}", json_str);
+        }
+
         let response = self
             .client
             .post(&url)
@@ -100,6 +111,13 @@ impl ClaudeAI {
             .map(|c| c.message.content.clone())
             .ok_or_else(|| anyhow!("No choices in Claude response"))?;
 
+        debug!("Claude API response content (first 500 chars): {}", 
+            if content.len() > 500 { 
+                format!("{}...", content.chars().take(500).collect::<String>())
+            } else { 
+                content.clone() 
+            }
+        );
         info!("Received response from Claude API");
 
         Ok(content)
@@ -251,43 +269,40 @@ impl ClaudeAI {
         self.chat(messages, Some(system_prompt)).await
     }
 
-    /// Analyze image(s) with Claude AI vision capability
-    /// Images should be passed as base64-encoded strings with their MIME type
-    pub async fn analyze_image_with_text(
-        &self,
-        text_prompt: String,
-        images: Vec<(String, String)>, // (base64, mime_type)
-    ) -> Result<String> {
-        let mut blocks = vec![
-            ContentBlock {
-                block_type: "text".to_string(),
-                text: Some(text_prompt.clone()),
-                image_url: None,
-            }
-        ];
+     /// Analyze image(s) with Claude AI vision capability
+     /// Images should be passed as direct URLs (tokenator.cloud will download them)
+     pub async fn analyze_image_with_text(
+         &self,
+         text_prompt: String,
+         image_urls: Vec<String>, // Direct image URLs
+     ) -> Result<String> {
+         debug!("📋 Vision API prompt: {}", text_prompt);
+         
+         let mut blocks = vec![
+             ContentBlock {
+                 block_type: "text".to_string(),
+                 text: Some(text_prompt.clone()),
+                 image_url: None,
+             }
+         ];
 
-        // Log image info for debugging
-        let mut total_size = 0u64;
-        for (base64_data, mime_type) in images {
-            total_size += base64_data.len() as u64;
-            debug!(
-                "Adding image block: type={}, size={} bytes (base64)",
-                mime_type, base64_data.len()
-            );
-            blocks.push(ContentBlock {
-                block_type: "image".to_string(),
-                text: None,
-                image_url: Some(ImageUrl {
-                    url: format!("data:{};base64,{}", mime_type, base64_data),
-                }),
-            });
-        }
-        
-        debug!(
-            "Sending vision request with {} image(s), total base64 size: {} MB",
-            blocks.len() - 1,
-            (total_size as f64) / (1024.0 * 1024.0)
-        );
+         // Log image info for debugging
+         debug!("Adding {} image URL(s) to vision request", image_urls.len());
+         for (idx, url) in image_urls.iter().enumerate() {
+             debug!("  Image {}: {}", idx + 1, url);
+             blocks.push(ContentBlock {
+                 block_type: "image".to_string(),
+                 text: None,
+                 image_url: Some(ImageUrl {
+                     url: url.clone(),
+                 }),
+             });
+         }
+         
+         debug!(
+             "Sending vision request with {} image(s) from direct URLs",
+             blocks.len() - 1
+         );
 
         let messages = vec![Message {
             role: "user".to_string(),

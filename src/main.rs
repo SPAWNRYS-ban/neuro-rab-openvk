@@ -1004,42 +1004,24 @@ async fn generate_bot_response(
         .to_string();
 
     // FIRST: Check if comment has image attachments and Vision API is enabled
-    let mut images_to_analyze: Vec<(String, String)> = Vec::new();
-    if config.enable_vision_api {
+    let image_urls = if config.enable_vision_api {
         if let Some(attachments) = &comment.attachments {
-            let image_urls = image_handler::extract_image_urls_from_attachments(attachments);
-            
-            for url in image_urls {
-                // Use size limit from config
-                match image_handler::process_image_with_size_limit(
-                    &url,
-                    Some(config.vision_api_max_image_size_mb),
-                )
-                .await
-                {
-                    Ok((base64, mime_type)) => {
-                        info!(
-                            "✅ Successfully processed image from comment, size: {} bytes",
-                            base64.len()
-                        );
-                        images_to_analyze.push((base64, mime_type));
-                    }
-                    Err(e) => {
-                        warn!("Failed to process image from comment: {} (will skip this image)", e);
-                        // Continue processing other images even if one fails
-                    }
-                }
-            }
+            let urls = image_handler::extract_image_urls_from_attachments(attachments);
+            info!("📸 generate_bot_response: Found {} image URLs from {} attachments", urls.len(), attachments.len());
+            urls
+        } else {
+            Vec::new()
         }
     } else {
         info!("Vision API is disabled in config");
-    }
+        Vec::new()
+    };
 
     // If we have images, use vision analysis
-    let mut final_response = if !images_to_analyze.is_empty() {
+    let mut final_response = if !image_urls.is_empty() {
         info!(
             "🖼️ Comment has {} image(s), using vision analysis",
-            images_to_analyze.len()
+            image_urls.len()
         );
         
         let image_prompt = if clean_text.is_empty() {
@@ -1051,8 +1033,8 @@ async fn generate_bot_response(
             )
         };
 
-        // Use vision analysis with images
-        match claude_ai.analyze_image_with_text(image_prompt, images_to_analyze).await {
+        // Use vision analysis with images (pass URLs directly)
+        match claude_ai.analyze_image_with_text(image_prompt, image_urls).await {
             Ok(response) => {
                 info!("✅ Vision analysis completed successfully");
                 response
@@ -1143,16 +1125,23 @@ async fn handle_wall_posts(
     db: &Arc<Database>,
     config: &Config,
 ) -> Result<()> {
+    info!("🔄 handle_wall_posts: Starting to fetch wall posts for bot_id={}", config.openvk_bot_id);
+    
     // Fetch recent posts from bot's own wall
     let posts = openvk_client
         .wall_get(config.openvk_bot_id as i64, 20, 0)
         .await?;
+    
+    info!("📊 handle_wall_posts: Fetched {} posts", posts.len());
 
     for post in posts {
         // Skip if already processed
         if db.is_wall_post_processed(post.id)? {
+            info!("⏭️  Post {}_{} already processed, skipping", post.owner_id, post.id);
             continue;
         }
+        
+        info!("🆕 Post {}_{} is NEW, will process now", post.owner_id, post.id);
 
         info!(
             "📝 New wall post {}_{} - text: \"{}\"",
@@ -1160,6 +1149,17 @@ async fn handle_wall_posts(
             post.id,
             truncate_str(&post.text, 60)
         );
+
+        // DEBUG: Log attachments info
+        if let Some(attachments) = &post.attachments {
+            info!(
+                "🔍 Post has {} attachment(s): {:?}",
+                attachments.len(),
+                attachments
+            );
+        } else {
+            info!("🔍 Post has NO attachments (attachments field is None)");
+        }
 
         // Fetch author info for this post to include in response
         let author_id = post.from_id.unwrap_or(post.owner_id).unsigned_abs();
