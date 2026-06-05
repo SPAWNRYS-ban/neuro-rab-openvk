@@ -261,13 +261,19 @@ impl ClaudeAI {
         let mut blocks = vec![
             ContentBlock {
                 block_type: "text".to_string(),
-                text: Some(text_prompt),
+                text: Some(text_prompt.clone()),
                 image_url: None,
             }
         ];
 
-        // Add image blocks
+        // Log image info for debugging
+        let mut total_size = 0u64;
         for (base64_data, mime_type) in images {
+            total_size += base64_data.len() as u64;
+            debug!(
+                "Adding image block: type={}, size={} bytes (base64)",
+                mime_type, base64_data.len()
+            );
             blocks.push(ContentBlock {
                 block_type: "image".to_string(),
                 text: None,
@@ -276,12 +282,30 @@ impl ClaudeAI {
                 }),
             });
         }
+        
+        debug!(
+            "Sending vision request with {} image(s), total base64 size: {} MB",
+            blocks.len() - 1,
+            (total_size as f64) / (1024.0 * 1024.0)
+        );
 
         let messages = vec![Message {
             role: "user".to_string(),
             content: MessageContent::Rich(blocks),
         }];
 
-        self.chat(messages, None).await
+        match self.chat(messages, None).await {
+            Ok(result) => {
+                info!("✅ Vision analysis succeeded");
+                Ok(result)
+            }
+            Err(e) => {
+                error!(
+                    "❌ Vision analysis failed ({}), will fallback to text-only",
+                    e
+                );
+                Err(e)
+            }
+        }
     }
 }

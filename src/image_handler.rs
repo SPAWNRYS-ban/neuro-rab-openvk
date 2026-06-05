@@ -118,14 +118,38 @@ pub fn guess_mime_type(data: &[u8]) -> String {
 }
 
 /// Process a single image from URL: download and encode to base64 with MIME type
+/// Optionally validates size limit (in MB) for Vision API compatibility
 pub async fn process_image(url: &str) -> Result<(String, String)> {
+    process_image_with_size_limit(url, None).await
+}
+
+/// Process image with optional size limit validation
+/// size_limit_mb: if Some(n), rejects images larger than n MB (for API limits)
+pub async fn process_image_with_size_limit(
+    url: &str,
+    size_limit_mb: Option<u64>,
+) -> Result<(String, String)> {
     match download_image(url).await {
         Ok(data) => {
+            let size_mb = (data.len() as f64) / (1024.0 * 1024.0);
+            
+            // Check size limit if provided
+            if let Some(limit_mb) = size_limit_mb {
+                if (data.len() as u64) > limit_mb * 1024 * 1024 {
+                    return Err(anyhow!(
+                        "Image too large: {:.2} MB exceeds limit of {} MB",
+                        size_mb,
+                        limit_mb
+                    ));
+                }
+            }
+            
             let mime_type = guess_mime_type(&data);
             let base64 = encode_to_base64(&data);
             debug!(
-                "Successfully processed image from {}: {} bytes, type: {}",
+                "Successfully processed image from {}: {:.2} MB ({} bytes), type: {}",
                 truncate_url(url),
+                size_mb,
                 data.len(),
                 mime_type
             );

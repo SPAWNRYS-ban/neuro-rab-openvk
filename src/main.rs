@@ -1003,23 +1003,36 @@ async fn generate_bot_response(
         .trim()
         .to_string();
 
-    // FIRST: Check if comment has image attachments
+    // FIRST: Check if comment has image attachments and Vision API is enabled
     let mut images_to_analyze: Vec<(String, String)> = Vec::new();
-    if let Some(attachments) = &comment.attachments {
-        let image_urls = image_handler::extract_image_urls_from_attachments(attachments);
-        
-        for url in image_urls {
-            match image_handler::process_image(&url).await {
-                Ok((base64, mime_type)) => {
-                    info!("✅ Successfully processed image from comment, size: {} bytes", base64.len());
-                    images_to_analyze.push((base64, mime_type));
-                }
-                Err(e) => {
-                    warn!("Failed to process image from comment: {}", e);
-                    // Continue processing other images even if one fails
+    if config.enable_vision_api {
+        if let Some(attachments) = &comment.attachments {
+            let image_urls = image_handler::extract_image_urls_from_attachments(attachments);
+            
+            for url in image_urls {
+                // Use size limit from config
+                match image_handler::process_image_with_size_limit(
+                    &url,
+                    Some(config.vision_api_max_image_size_mb),
+                )
+                .await
+                {
+                    Ok((base64, mime_type)) => {
+                        info!(
+                            "✅ Successfully processed image from comment, size: {} bytes",
+                            base64.len()
+                        );
+                        images_to_analyze.push((base64, mime_type));
+                    }
+                    Err(e) => {
+                        warn!("Failed to process image from comment: {} (will skip this image)", e);
+                        // Continue processing other images even if one fails
+                    }
                 }
             }
         }
+    } else {
+        info!("Vision API is disabled in config");
     }
 
     // If we have images, use vision analysis

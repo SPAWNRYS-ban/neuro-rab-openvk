@@ -44,6 +44,8 @@ pub struct Config {
     pub context_memory_size: usize,
     pub notif_poll_interval_secs: u64,
     pub bot_mention_aliases: Vec<String>,
+    pub enable_vision_api: bool,
+    pub vision_api_max_image_size_mb: u64,
 }
 
 impl Config {
@@ -118,6 +120,12 @@ impl Config {
                 .map(|x| x.trim().to_string())
                 .filter(|x| !x.is_empty())
                 .collect(),
+            enable_vision_api: env::var("ENABLE_VISION_API")
+                .unwrap_or_else(|_| "true".to_string())
+                .parse()?,
+            vision_api_max_image_size_mb: env::var("VISION_API_MAX_IMAGE_SIZE_MB")
+                .unwrap_or_else(|_| "20".to_string())
+                .parse()?,
         })
     }
 }
