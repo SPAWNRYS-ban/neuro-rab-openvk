@@ -2,6 +2,7 @@ mod ai;
 mod config;
 mod context;
 mod db;
+mod image_handler;
 mod logger;
 mod longpoll_manager;
 mod openvk;
@@ -106,7 +107,7 @@ async fn main() -> Result<()> {
         BotMode::Wall => {
             info!("Running in Wall polling mode");
             run_wall_polling(
-                openvk_client.as_ref(),
+                openvk_client.clone(),
                 &claude_ai,
                 &search_engine,
                 &scraper,
@@ -136,7 +137,7 @@ async fn main() -> Result<()> {
 
 /// Run bot in wall polling mode (legacy mode)
 async fn run_wall_polling(
-    openvk_client: &OpenVKClient,
+    openvk_client: Arc<OpenVKClient>,
     claude_ai: &ClaudeAI,
     search_engine: &DuckDuckGoSearch,
     scraper: &WebScraper,
@@ -150,7 +151,7 @@ async fn run_wall_polling(
 
     loop {
         match run_poll_iteration(
-            openvk_client,
+            openvk_client.as_ref(),
             claude_ai,
             search_engine,
             scraper,
@@ -164,6 +165,24 @@ async fn run_wall_polling(
             Ok(_) => {}
             Err(e) => {
                 error!("Error during poll iteration: {}", e);
+            }
+        }
+
+        // Handle auto-response to wall posts
+        match handle_wall_posts(
+            openvk_client.clone(),
+            claude_ai,
+            search_engine,
+            scraper,
+            context_manager,
+            db,
+            config,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                error!("Error handling wall posts: {}", e);
             }
         }
 
@@ -267,99 +286,119 @@ async fn run_longpoll_listener(
         Err(e) => error!("Failed to seed notifications on startup: {}", e),
     }
 
-    // Throttle the notifications poll so we don't hit the API every cycle.
-    let notif_interval = Duration::from_secs(config.notif_poll_interval_secs);
-    let mut last_notif_poll = std::time::Instant::now()
-        .checked_sub(notif_interval)
-        .unwrap_or_else(std::time::Instant::now);
+     // Use tokio::select! to run LongPoll and Notifications polling in parallel.
+     // This prevents the 3-second LongPoll throttle from blocking Notifications polling.
+     let mut notif_interval_timer = tokio::time::interval(Duration::from_secs(config.notif_poll_interval_secs));
+     let mut wall_posts_timer = tokio::time::interval(Duration::from_secs(config.notif_poll_interval_secs));
 
-    loop {
-        // --- 1. Poll personal messages via LongPoll history ---
-        match openvk_client.longpoll_listen(&mut server_data).await {
-            Ok(notifications) => {
-                for notification in notifications {
-                    if let Err(e) = handle_longpoll_notification(
-                        notification,
-                        openvk_client.as_ref(),
-                        claude_ai,
-                        search_engine,
-                        scraper,
-                        context_manager,
-                        db,
-                        config,
-                    )
-                    .await
-                    {
-                        error!("Error handling LongPoll DM: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                // Distinguish a transient NETWORK timeout from a real API error.
-                //
-                // A timeout just means openvk.xyz was slow to respond this once.
-                // We must NOT re-fetch the LongPoll server in that case, because
-                // re-fetching resets `ts` and can DROP events that arrived between
-                // the old and new ts (i.e. silently lose messages). Instead we
-                // keep the SAME `ts` and simply retry — getLongPollHistory will
-                // return those events on the next poll. Only a genuine API /
-                // protocol error (e.g. an expired ts) warrants re-fetching.
-                let msg = e.to_string().to_lowercase();
-                let is_transient = msg.contains("timed out")
-                    || msg.contains("timeout")
-                    || msg.contains("error sending request")
-                    || msg.contains("connection")
-                    || msg.contains("connect")
-                    || msg.contains("body");
+     loop {
+         tokio::select! {
+             // --- 1. Poll personal messages via LongPoll history (non-blocking) ---
+             longpoll_result = openvk_client.longpoll_listen(&mut server_data) => {
+                 match longpoll_result {
+                     Ok(notifications) => {
+                         for notification in notifications {
+                             if let Err(e) = handle_longpoll_notification(
+                                 notification,
+                                 openvk_client.as_ref(),
+                                 claude_ai,
+                                 search_engine,
+                                 scraper,
+                                 context_manager,
+                                 db,
+                                 config,
+                             )
+                             .await
+                             {
+                                 error!("Error handling LongPoll DM: {}", e);
+                             }
+                         }
+                     }
+                     Err(e) => {
+                         // Distinguish a transient NETWORK timeout from a real API error.
+                         //
+                         // A timeout just means openvk.xyz was slow to respond this once.
+                         // We must NOT re-fetch the LongPoll server in that case, because
+                         // re-fetching resets `ts` and can DROP events that arrived between
+                         // the old and new ts (i.e. silently lose messages). Instead we
+                         // keep the SAME `ts` and simply retry — getLongPollHistory will
+                         // return those events on the next poll. Only a genuine API /
+                         // protocol error (e.g. an expired ts) warrants re-fetching.
+                         let msg = e.to_string().to_lowercase();
+                         let is_transient = msg.contains("timed out")
+                             || msg.contains("timeout")
+                             || msg.contains("error sending request")
+                             || msg.contains("connection")
+                             || msg.contains("connect")
+                             || msg.contains("body");
 
-                if is_transient {
-                    warn!("LongPoll transient network error: {} — retrying with same ts in 2s", e);
-                    sleep(Duration::from_secs(2)).await;
-                } else {
-                    error!("LongPoll API error: {} — re-fetching server, retrying in 3s", e);
-                    sleep(Duration::from_secs(3)).await;
-                    if let Ok(sd) = openvk_client.messages_get_longpoll_server().await {
-                        server_data = sd;
-                    }
-                }
-            }
-        }
+                         if is_transient {
+                             warn!("LongPoll transient network error: {} — retrying with same ts in 2s", e);
+                             sleep(Duration::from_secs(2)).await;
+                         } else {
+                             error!("LongPoll API error: {} — re-fetching server, retrying in 3s", e);
+                             sleep(Duration::from_secs(3)).await;
+                             if let Ok(sd) = openvk_client.messages_get_longpoll_server().await {
+                                 server_data = sd;
+                             }
+                         }
+                     }
+                 }
+             }
 
-        // --- 2. Poll notifications (mentions + comments) periodically ---
-        if last_notif_poll.elapsed() >= notif_interval {
-            last_notif_poll = std::time::Instant::now();
-            match openvk_client.notifications_get(20).await {
-                Ok(notifs) => {
-                    let mut handled_any = false;
-                    for notif in &notifs {
-                        match handle_notification(
-                            notif,
-                            openvk_client.as_ref(),
-                            claude_ai,
-                            search_engine,
-                            scraper,
-                            context_manager,
-                            db,
-                            config,
-                        )
-                        .await
-                        {
-                            Ok(did_handle) => handled_any |= did_handle,
-                            Err(e) => error!("Error handling notification: {}", e),
-                        }
-                    }
+             // --- 2. Poll notifications (mentions + comments) periodically (non-blocking) ---
+             _ = notif_interval_timer.tick() => {
+                 match openvk_client.notifications_get(20).await {
+                     Ok(notifs) => {
+                         let mut handled_any = false;
+                         for notif in &notifs {
+                             match handle_notification(
+                                 notif,
+                                 openvk_client.as_ref(),
+                                 claude_ai,
+                                 search_engine,
+                                 scraper,
+                                 context_manager,
+                                 db,
+                                 config,
+                             )
+                             .await
+                             {
+                                 Ok(did_handle) => handled_any |= did_handle,
+                                 Err(e) => error!("Error handling notification: {}", e),
+                             }
+                         }
 
-                    // After processing a fresh batch, clear the web UI unread
-                    // badge. The authoritative "already handled" state lives in
-                    // our DB, so this is purely cosmetic and best-effort.
-                    if handled_any {
-                        let _ = openvk_client.notifications_mark_as_viewed().await;
-                    }
-                }
-                Err(e) => error!("notifications.get error: {}", e),
-            }
-        }
-    }
+                         // After processing a fresh batch, clear the web UI unread
+                         // badge. The authoritative "already handled" state lives in
+                         // our DB, so this is purely cosmetic and best-effort.
+                         if handled_any {
+                             let _ = openvk_client.notifications_mark_as_viewed().await;
+                         }
+                     }
+                     Err(e) => error!("notifications.get error: {}", e),
+                 }
+             }
+
+             // --- 3. Poll wall posts for auto-response periodically (non-blocking) ---
+             _ = wall_posts_timer.tick() => {
+                 match handle_wall_posts(
+                     openvk_client.clone(),
+                     claude_ai,
+                     search_engine,
+                     scraper,
+                     context_manager,
+                     db,
+                     config,
+                 )
+                 .await
+                 {
+                     Ok(_) => {}
+                     Err(e) => error!("Error handling wall posts: {}", e),
+                 }
+             }
+         }
+     }
 }
 
 
@@ -444,6 +483,23 @@ async fn handle_notification(
                     )
                     .await
                     .ok();
+            }
+
+            // --- If this is a repost, add context from original posts in the chain ---
+            if p.is_repost() {
+                for original in p.get_original_posts() {
+                    let original_author = original.from_id.unwrap_or(original.owner_id).unsigned_abs();
+                    context_manager
+                        .add_comment_context(
+                            original.owner_id,
+                            original.id,
+                            original_author,
+                            format!("Оригинальный пост от {}", original_author),
+                            original.text.clone(),
+                        )
+                        .await
+                        .ok();
+                }
             }
         }
     }
@@ -828,6 +884,29 @@ async fn process_post(
         .wall_get_comments(owner_id, post_id, 100, 0)
         .await?;
 
+    // If we need to fetch the full post object for copy_history context, do it here
+    // This enriches the context with original posts from repost chains
+    if let Ok(posts) = openvk_client.wall_get_by_id(owner_id, post_id).await {
+        if let Some(post) = posts.first() {
+            if post.is_repost() {
+                // Add context from all original posts in the chain
+                for original in post.get_original_posts() {
+                    let original_author = original.from_id.unwrap_or(original.owner_id).unsigned_abs();
+                    context_manager
+                        .add_comment_context(
+                            original.owner_id,
+                            original.id,
+                            original_author,
+                            format!("Оригинальный пост от {}", original_author),
+                            original.text.clone(),
+                        )
+                        .await
+                        .ok();
+                }
+            }
+        }
+    }
+
     for comment in comments {
         // Check if comment has already been processed
         if db.is_comment_processed(comment.id)? {
@@ -924,47 +1003,99 @@ async fn generate_bot_response(
         .trim()
         .to_string();
 
-    // Check if user is asking for fact checking or web search
-    let needs_web_search = clean_text.contains("проверить") || clean_text.contains("найти")
-        || clean_text.contains("check") || clean_text.contains("search")
-        || clean_text.contains("look");
-
-    let mut final_response = if needs_web_search {
-        // Perform web search
-        match search_engine.search(&clean_text).await {
-            Ok(results) => {
-                if !results.is_empty() {
-                    let search_context = results
-                        .iter()
-                        .take(3)
-                        .map(|r| format!("{}: {}", r.title, r.snippet))
-                        .collect::<Vec<_>>()
-                        .join("\n\n");
-
-                    let ai_prompt = format!(
-                        "Основываясь на следующих результатах поиска, ответь на вопрос: {}\n\nРезультаты:\n{}",
-                        clean_text, search_context
-                    );
-
-                    claude_ai.generate_response_with_context(ai_prompt, context).await?
-                } else {
-                    claude_ai
-                        .generate_response_with_context(clean_text.clone(), context)
-                        .await?
+    // FIRST: Check if comment has image attachments
+    let mut images_to_analyze: Vec<(String, String)> = Vec::new();
+    if let Some(attachments) = &comment.attachments {
+        let image_urls = image_handler::extract_image_urls_from_attachments(attachments);
+        
+        for url in image_urls {
+            match image_handler::process_image(&url).await {
+                Ok((base64, mime_type)) => {
+                    info!("✅ Successfully processed image from comment, size: {} bytes", base64.len());
+                    images_to_analyze.push((base64, mime_type));
+                }
+                Err(e) => {
+                    warn!("Failed to process image from comment: {}", e);
+                    // Continue processing other images even if one fails
                 }
             }
+        }
+    }
+
+    // If we have images, use vision analysis
+    let mut final_response = if !images_to_analyze.is_empty() {
+        info!(
+            "🖼️ Comment has {} image(s), using vision analysis",
+            images_to_analyze.len()
+        );
+        
+        let image_prompt = if clean_text.is_empty() {
+            "Проанализируй это изображение и дай подробный ответ на русском языке.".to_string()
+        } else {
+            format!(
+                "Вот изображение и вопрос/комментарий:\n\n{}\n\nПожалуйста, помоги на основе изображения и текста выше.",
+                clean_text
+            )
+        };
+
+        // Use vision analysis with images
+        match claude_ai.analyze_image_with_text(image_prompt, images_to_analyze).await {
+            Ok(response) => {
+                info!("✅ Vision analysis completed successfully");
+                response
+            }
             Err(e) => {
-                error!("Web search failed: {}", e);
+                error!("Failed to analyze image: {}", e);
+                // Fallback to text-only analysis if vision fails
+                warn!("Falling back to text-only analysis due to vision error");
                 claude_ai
                     .generate_response_with_context(clean_text.clone(), context)
                     .await?
             }
         }
     } else {
-        // Regular response
-        claude_ai
-            .generate_response_with_context(clean_text.clone(), context)
-            .await?
+        // No images - use regular text-based response
+        let needs_web_search = clean_text.contains("проверить") || clean_text.contains("найти")
+            || clean_text.contains("check") || clean_text.contains("search")
+            || clean_text.contains("look");
+
+        if needs_web_search {
+            // Perform web search
+            match search_engine.search(&clean_text).await {
+                Ok(results) => {
+                    if !results.is_empty() {
+                        let search_context = results
+                            .iter()
+                            .take(3)
+                            .map(|r| format!("{}: {}", r.title, r.snippet))
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+
+                        let ai_prompt = format!(
+                            "Основываясь на следующих результатах поиска, ответь на вопрос: {}\n\nРезультаты:\n{}",
+                            clean_text, search_context
+                        );
+
+                        claude_ai.generate_response_with_context(ai_prompt, context).await?
+                    } else {
+                        claude_ai
+                            .generate_response_with_context(clean_text.clone(), context)
+                            .await?
+                    }
+                }
+                Err(e) => {
+                    error!("Web search failed: {}", e);
+                    claude_ai
+                        .generate_response_with_context(clean_text.clone(), context)
+                        .await?
+                }
+            }
+        } else {
+            // Regular response
+            claude_ai
+                .generate_response_with_context(clean_text.clone(), context)
+                .await?
+        }
     };
 
     // Check for URLs in the comment and scrape if needed
@@ -977,6 +1108,138 @@ async fn generate_bot_response(
 
     Ok(final_response)
 
+}
+
+/// Handle wall posts on bot's own wall - auto-respond to any post
+/// (not just mentions like comments). Spawns responses asynchronously to not block.
+async fn handle_wall_posts(
+    openvk_client: Arc<OpenVKClient>,
+    claude_ai: &ClaudeAI,
+    search_engine: &DuckDuckGoSearch,
+    scraper: &WebScraper,
+    context_manager: &ContextManager,
+    db: &Arc<Database>,
+    config: &Config,
+) -> Result<()> {
+    // Fetch recent posts from bot's own wall
+    let posts = openvk_client
+        .wall_get(config.openvk_bot_id as i64, 20, 0)
+        .await?;
+
+    for post in posts {
+        // Skip if already processed
+        if db.is_wall_post_processed(post.id)? {
+            continue;
+        }
+
+        info!(
+            "📝 New wall post {}_{} - text: \"{}\"",
+            post.owner_id,
+            post.id,
+            truncate_str(&post.text, 60)
+        );
+
+        // Fetch author info for this post to include in response
+        let author_id = post.from_id.unwrap_or(post.owner_id).unsigned_abs();
+        let author_name = match openvk_client.users_get(vec![author_id]).await {
+            Ok(users) => {
+                if let Some(user) = users.first() {
+                    user.display_name()
+                } else {
+                    format!("user_{}", author_id)
+                }
+            }
+            Err(e) => {
+                warn!("Failed to fetch user info for {}: {}", author_id, e);
+                format!("user_{}", author_id)
+            }
+        };
+
+        // Add post to context (seeding for AI context awareness)
+        context_manager
+            .add_comment_context(
+                post.owner_id,
+                post.id,
+                author_id,
+                author_name.clone(),
+                post.text.clone(),
+            )
+            .await
+            .ok();
+
+        // Create dummy comment struct for generate_bot_response
+        let dummy_comment = Comment {
+            id: post.id,
+            owner_id: post.owner_id,
+            author_id,
+            text: post.text.clone(),
+            reply_to_comment: None,
+            reply_to_user: None,
+            date: post.date,
+            likes_count: None,
+            likes: None,
+            attachments: None,
+            can_edit: None,
+            can_delete: None,
+        };
+
+        // Generate AI response
+        match generate_bot_response(
+            &dummy_comment,
+            claude_ai,
+            search_engine,
+            scraper,
+            context_manager,
+            config,
+            post.owner_id,
+            post.id,
+        )
+        .await
+        {
+            Ok(mut response) => {
+                // Limit response length for OpenVK API
+                if response.chars().count() > 10000 {
+                    response = format!("{}...", truncate_str(&response, 9997));
+                }
+
+                // Post the response as a comment
+                match openvk_client.wall_create_comment(post.owner_id, post.id, response.clone()).await {
+                    Ok(comment_id) => {
+                        info!("✅ Posted auto-response comment {} on wall post {}_{}", comment_id, post.owner_id, post.id);
+
+                        // Mark post as processed in database
+                        if let Err(e) = db.add_processed_wall_post(&db::ProcessedWallPost {
+                            post_id: post.id,
+                            wall_owner_id: post.owner_id,
+                            processed_at: chrono::Utc::now().to_rfc3339(),
+                        }) {
+                            error!("Failed to mark wall post {} as processed: {}", post.id, e);
+                        }
+
+                        // Add bot's response to context for conversation memory
+                        context_manager
+                            .add_comment_context(
+                                post.owner_id,
+                                post.id,
+                                config.openvk_bot_id,
+                                config.bot_name.clone(),
+                                response,
+                            )
+                            .await
+                            .ok();
+                    }
+                    Err(e) => {
+                        error!("Failed to post auto-response on wall post {}_{}: {}", post.owner_id, post.id, e);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to generate response for wall post {}_{}: {}", post.owner_id, post.id, e);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn extract_and_analyze_urls(

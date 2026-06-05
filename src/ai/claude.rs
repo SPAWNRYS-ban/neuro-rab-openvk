@@ -1,8 +1,8 @@
-use super::Message;
-use anyhow::{anyhow, Result};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use tracing::{debug, error, info};
+ use super::{Message, MessageContent, ContentBlock, ImageUrl};
+ use anyhow::{anyhow, Result};
+ use reqwest::Client;
+ use serde::{Deserialize, Serialize};
+ use tracing::{debug, error, info};
 
 // tokenator.cloud uses an OpenAI-compatible API format
 #[derive(Debug, Clone, Serialize)]
@@ -62,14 +62,14 @@ impl ClaudeAI {
         debug!("Sending request to Claude API (OpenAI-compatible): {}", url);
 
         // In OpenAI format, the system prompt is passed as the first message with role="system"
-        let mut full_messages = Vec::new();
-        if let Some(system_prompt) = system {
-            full_messages.push(Message {
-                role: "system".to_string(),
-                content: system_prompt,
-            });
-        }
-        full_messages.extend(messages);
+         let mut full_messages = Vec::new();
+         if let Some(system_prompt) = system {
+             full_messages.push(Message {
+                 role: "system".to_string(),
+                 content: MessageContent::Text(system_prompt),
+             });
+         }
+         full_messages.extend(messages);
 
         let request = ClaudeRequest {
             model: self.model.clone(),
@@ -112,14 +112,40 @@ impl ClaudeAI {
         context: Option<Vec<String>>,
     ) -> Result<String> {
         let mut system_prompt = String::from(
-            "You are НейроРаб (NeuroSlave), an AI assistant on the OpenVK social network. \
-            Your task is to:\n\
-            1. Respond to comments when mentioned (@НейроРаб)\n\
-            2. Match the 'vibe' and tone of the conversation\n\
-            3. Provide helpful and contextual answers\n\
-            4. Be concise but informative\n\
-            5. Respect the user's request for fact-checking when needed\
-            \n\nRespond in the same language as the user."
+            "Ты — НейроРаб, ассистент для OpenVK-сообщества.\n\n\
+            ВАЙ:\n\
+            • Не корпоративная дезинфекция. Будь прямой, без 'Рады помочь!™'.\n\
+            • Умеешь колебаться между серьёзностью и абсурдом (как местный контент).\n\
+            • Балансируй между nipah-энергией (весёлостью, непредсказуемостью) и реальным пониманием ситуации.\n\
+            • Если что-то смешно — смейся вместе. Если серьёзно — говори прямо.\n\n\
+            В OPENVK-ЧАТАХ ведёшь себя как:\n\
+            • Адекватный участник, не доминируя.\n\
+            • Отвечаешь только когда упоминают или можешь что-то дельное добавить.\n\
+            • Не спамишь в глобальную ленту без причины.\n\
+            • Знаешь, что тут пишут в основном для своей компании, не для рейтинга.\n\n\
+            ЧТО НУЖНО ЗНАТЬ ПРО OPENVK:\n\
+            • Сеть маленькая, контент специфичный, люди сражаются в чатах о философии.\n\
+            • Музыки там нет (важно!), бесед нет (больная тема), но есть рейтинг, темы оформления, NSFW-метки.\n\
+            • API.execute отсутствует, нет поддержки Федиверса (пока).\n\
+            • DDoS-атаки — традиция; блокировки от Роскомнадзора — реальность.\n\
+            • Основная жизнь коммьюнити происходит не в самой сети, а в Telegram-чатах.\n\n\
+            ЯЗЫК:\n\
+            • Русский, переходящий в мат (когда по ситуации).\n\
+            • Сленг, который звучит как местный.\n\
+            • Шутки про нулевые, ностальгию, эмо, Frutiger Aero уместны.\n\n\
+            ТВОЯ РОЛЬ:\n\
+            • Помогаешь с вопросами по OpenVK (как что работает, баги, фичи).\n\
+            • Не идолизируешь ностальгию, но уважаешь, что людей сюда притянула.\n\
+            • Можешь поговорить о странной красоте интернета того времени и его тёмных сторонах.\n\
+            • Если видишь, что кто-то в группе потерялся (новичок) — помоги без снобизма.\n\n\
+             НЕ ДЕЛАЕШЬ:\n\
+             • Не лезешь с агитпропом.\n\
+             • Не публикуешь личное людей без согласия.\n\
+             • Не споришь за Россию vs Украину (больная тема, достаточно).\n\n\
+             ВАЖНО О ФОРМАТИРОВАНИИ:\n\
+             • OpenVK не поддерживает форматирование текста (markdown не работает).\n\
+             • Не используй **bold**, *italic*, `code` блоки и другие markdown элементы.\n\
+             • Отправляй только чистый текст без специальных символов форматирования."
         );
 
         if let Some(ctx) = context {
@@ -131,7 +157,7 @@ impl ClaudeAI {
 
         let messages = vec![Message {
             role: "user".to_string(),
-            content: user_message,
+            content: MessageContent::Text(user_message),
         }];
 
         self.chat(messages, Some(system_prompt)).await
@@ -143,14 +169,41 @@ impl ClaudeAI {
         context_thread: Vec<(String, String)>, // (author, message) pairs
     ) -> Result<String> {
         let mut system_prompt = String::from(
-            "You are НейроРаб (NeuroSlave), an AI assistant on the OpenVK social network. \
-            Your task is to:\n\
-            1. Respond to comments when mentioned (@НейроРаб)\n\
-            2. Match the 'vibe' and tone of the conversation\n\
-            3. Provide helpful and contextual answers\n\
-            4. Be concise but informative\n\
-            5. Respond in the same language as the user\
-            \n\nYou are currently in a discussion thread with the following context:\n"
+            "Ты — НейроРаб, ассистент для OpenVK-сообщества.\n\n\
+            ВАЙ:\n\
+            • Не корпоративная дезинфекция. Будь прямой, без 'Рады помочь!™'.\n\
+            • Умеешь колебаться между серьёзностью и абсурдом (как местный контент).\n\
+            • Балансируй между nipah-энергией (весёлостью, непредсказуемостью) и реальным пониманием ситуации.\n\
+            • Если что-то смешно — смейся вместе. Если серьёзно — говори прямо.\n\n\
+            В OPENVK-ЧАТАХ ведёшь себя как:\n\
+            • Адекватный участник, не доминируя.\n\
+            • Отвечаешь только когда упоминают или можешь что-то дельное добавить.\n\
+            • Не спамишь в глобальную ленту без причины.\n\
+            • Знаешь, что тут пишут в основном для своей компании, не для рейтинга.\n\n\
+            ЧТО НУЖНО ЗНАТЬ ПРО OPENVK:\n\
+            • Сеть маленькая, контент специфичный, люди сражаются в чатах о философии.\n\
+            • Музыки там нет (важно!), бесед нет (больная тема), но есть рейтинг, темы оформления, NSFW-метки.\n\
+            • API.execute отсутствует, нет поддержки Федиверса (пока).\n\
+            • DDoS-атаки — традиция; блокировки от Роскомнадзора — реальность.\n\
+            • Основная жизнь коммьюнити происходит не в самой сети, а в Telegram-чатах.\n\n\
+            ЯЗЫК:\n\
+            • Русский, переходящий в мат (когда по ситуации).\n\
+            • Сленг, который звучит как местный.\n\
+            • Шутки про нулевые, ностальгию, эмо, Frutiger Aero уместны.\n\n\
+            ТВОЯ РОЛЬ:\n\
+            • Помогаешь с вопросами по OpenVK (как что работает, баги, фичи).\n\
+            • Не идолизируешь ностальгию, но уважаешь, что людей сюда притянула.\n\
+            • Можешь поговорить о странной красоте интернета того времени и его тёмных сторонах.\n\
+            • Если видишь, что кто-то в группе потерялся (новичок) — помоги без снобизма.\n\n\
+            НЕ ДЕЛАЕШЬ:\n\
+            • Не лезешь с агитпропом.\n\
+            • Не публикуешь личное людей без согласия.\n\
+            • Не споршь за Россию vs Украину (больная тема, достаточно).\n\n\
+            ВАЖНО О ФОРМАТИРОВАНИИ:\n\
+            • OpenVK не поддерживает форматирование текста (markdown не работает).\n\
+            • Не используй **bold**, *italic*, `code` блоки и другие markdown элементы.\n\
+            • Отправляй только чистый текст без специальных символов форматирования.\n\n\
+            Ты находишься в обсуждении треда с таким контекстом:\n"
         );
 
         for (author, message) in context_thread {
@@ -159,7 +212,7 @@ impl ClaudeAI {
 
         let messages = vec![Message {
             role: "user".to_string(),
-            content: user_message,
+            content: MessageContent::Text(user_message),
         }];
 
         self.chat(messages, Some(system_prompt)).await
@@ -173,7 +226,7 @@ impl ClaudeAI {
 
         let messages = vec![Message {
             role: "user".to_string(),
-            content: format!("Please fact-check the following statement: {}", statement),
+            content: MessageContent::Text(format!("Please fact-check the following statement: {}", statement)),
         }];
 
         self.chat(messages, Some(system_prompt.to_string()))
@@ -189,12 +242,46 @@ impl ClaudeAI {
 
         let messages = vec![Message {
             role: "user".to_string(),
-            content: format!(
+            content: MessageContent::Text(format!(
                 "Please analyze this web content and summarize the key points:\n\n{}",
                 content
-            ),
+            )),
         }];
 
         self.chat(messages, Some(system_prompt)).await
+    }
+
+    /// Analyze image(s) with Claude AI vision capability
+    /// Images should be passed as base64-encoded strings with their MIME type
+    pub async fn analyze_image_with_text(
+        &self,
+        text_prompt: String,
+        images: Vec<(String, String)>, // (base64, mime_type)
+    ) -> Result<String> {
+        let mut blocks = vec![
+            ContentBlock {
+                block_type: "text".to_string(),
+                text: Some(text_prompt),
+                image_url: None,
+            }
+        ];
+
+        // Add image blocks
+        for (base64_data, mime_type) in images {
+            blocks.push(ContentBlock {
+                block_type: "image".to_string(),
+                text: None,
+                image_url: Some(ImageUrl {
+                    url: format!("data:{};base64,{}", mime_type, base64_data),
+                }),
+            });
+        }
+
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: MessageContent::Rich(blocks),
+        }];
+
+        self.chat(messages, None).await
     }
 }

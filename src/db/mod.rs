@@ -14,6 +14,13 @@ pub struct ProcessedComment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessedWallPost {
+    pub post_id: u64,
+    pub wall_owner_id: i64,
+    pub processed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextEntry {
     pub id: String,
     pub wall_owner_id: i64,
@@ -54,6 +61,12 @@ impl Database {
                 processed_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS processed_wall_posts (
+                post_id INTEGER PRIMARY KEY,
+                wall_owner_id INTEGER NOT NULL,
+                processed_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS context_cache (
                 id TEXT PRIMARY KEY,
                 wall_owner_id INTEGER NOT NULL,
@@ -72,6 +85,7 @@ impl Database {
             );
 
             CREATE INDEX IF NOT EXISTS idx_processed_comments_wall ON processed_comments(wall_owner_id);
+            CREATE INDEX IF NOT EXISTS idx_processed_wall_posts_wall ON processed_wall_posts(wall_owner_id);
             CREATE INDEX IF NOT EXISTS idx_context_cache_thread ON context_cache(thread_id);
             CREATE INDEX IF NOT EXISTS idx_web_cache_url ON web_cache(url);
             ",
@@ -121,6 +135,30 @@ impl Database {
         let exists: bool = self.conn.query_row(
             "SELECT COUNT(*) > 0 FROM processed_comments WHERE comment_id = ?",
             params![comment_id],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
+    }
+
+    // Processed Wall Posts Methods
+    pub fn add_processed_wall_post(&self, post: &ProcessedWallPost) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO processed_wall_posts 
+             (post_id, wall_owner_id, processed_at)
+             VALUES (?, ?, ?)",
+            params![
+                post.post_id,
+                post.wall_owner_id,
+                &post.processed_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_wall_post_processed(&self, post_id: u64) -> Result<bool> {
+        let exists: bool = self.conn.query_row(
+            "SELECT COUNT(*) > 0 FROM processed_wall_posts WHERE post_id = ?",
+            params![post_id],
             |row| row.get(0),
         )?;
         Ok(exists)

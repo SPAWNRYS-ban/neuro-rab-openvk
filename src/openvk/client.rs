@@ -2,7 +2,7 @@ use super::{
     Comment, Post, WallCreateCommentResponse, WallGetCommentsResponse, WallGetResponse,
 
     LongPollServerResponse, LongPollServerData, EventType, ParsedNotification, 
-    NotificationsGetResponse, Notification,
+    NotificationsGetResponse, Notification, User,
 };
 use anyhow::{anyhow, Result};
 use reqwest::Client;
@@ -38,6 +38,46 @@ impl OpenVKClient {
             api_url,
             api_token,
             hide_online_activity: hide_online_activity != 0,
+        }
+    }
+
+    /// Retry a request with exponential backoff on timeout errors
+    /// Returns Ok(result) on success, Err on final failure
+    async fn retry_with_backoff<F, Fut, T>(
+        &self,
+        mut f: F,
+        max_attempts: u32,
+    ) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let mut attempt = 0;
+        let mut backoff_secs = 1u64;
+
+        loop {
+            attempt += 1;
+            match f().await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    let err_msg = e.to_string().to_lowercase();
+                    let is_timeout = err_msg.contains("timed out")
+                        || err_msg.contains("timeout")
+                        || err_msg.contains("error sending request");
+
+                    if !is_timeout || attempt >= max_attempts {
+                        // Not a timeout or max attempts reached
+                        return Err(e);
+                    }
+
+                    warn!(
+                        "Request failed with timeout (attempt {}/{}), retrying in {}s: {}",
+                        attempt, max_attempts, backoff_secs, e
+                    );
+                    sleep(Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = std::cmp::min(backoff_secs * 2, 10); // Max 10s backoff
+                }
+            }
         }
     }
 
@@ -225,82 +265,100 @@ impl OpenVKClient {
             query_params.push(param);
         }
 
-        let response = self
-            .client
-            .post(&url)
-            .query(&query_params)
-            .send()
-            .await?;
+        self.retry_with_backoff(
+            || async {
+                let response = self
+                    .client
+                    .post(&url)
+                    .query(&query_params)
+                    .send()
+                    .await?;
 
-        let create_response: WallCreateCommentResponse = response.json().await?;
+                let create_response: WallCreateCommentResponse = response.json().await?;
 
-        if let Some(error) = create_response.error {
-            error!("OpenVK API error: {}", error.error_msg);
-            return Err(anyhow!("OpenVK API error: {}", error.error_msg));
-        }
+                if let Some(error) = create_response.error {
+                    error!("OpenVK API error: {}", error.error_msg);
+                    return Err(anyhow!("OpenVK API error: {}", error.error_msg));
+                }
 
-        let data = create_response
-            .response
-            .ok_or_else(|| anyhow!("No response from wall.createComment"))?;
+                let data = create_response
+                    .response
+                    .ok_or_else(|| anyhow!("No response from wall.createComment"))?;
 
-        info!("Successfully created comment with ID: {}", data.comment_id);
-        Ok(data.comment_id)
+                Ok(data.comment_id)
+            },
+            3,
+        )
+        .await
+        .map(|comment_id| {
+            info!("Successfully created comment with ID: {}", comment_id);
+            comment_id
+        })
     }
 
-    /// Create a reply to a specific comment
-    pub async fn wall_create_comment_reply(
-        &self,
-        owner_id: i64,
-        post_id: u64,
-        reply_to_comment: u64,
-        text: String,
-    ) -> Result<u64> {
-        let url = format!("{}/method/wall.createComment", self.api_url);
+     /// Create a reply to a specific comment
+     pub async fn wall_create_comment_reply(
+         &self,
+         owner_id: i64,
+         post_id: u64,
+         reply_to_comment: u64,
+         text: String,
+     ) -> Result<u64> {
+         let url = format!("{}/method/wall.createComment", self.api_url);
 
-        debug!(
-            "Creating reply to comment {} on post {}_{}\n",
-            reply_to_comment, owner_id, post_id
-        );
+         debug!(
+             "Creating reply to comment {} on post {}_{}\n",
+             reply_to_comment, owner_id, post_id
+         );
 
-        let mut query_params = vec![
-            ("owner_id", owner_id.to_string()),
-            ("post_id", post_id.to_string()),
-            ("reply_to_comment", reply_to_comment.to_string()),
-            ("message", text.clone()),
-            ("access_token", self.api_token.clone()),
-        ];
+         let mut query_params = vec![
+             ("owner_id", owner_id.to_string()),
+             ("post_id", post_id.to_string()),
+             ("reply_to_comment", reply_to_comment.to_string()),
+             ("message", text.clone()),
+             ("access_token", self.api_token.clone()),
+         ];
 
-        let hide_online = if self.hide_online_activity {
-            Some(("forGodSakePleaseDoNotReportAboutMyOnlineActivity", "1".to_string()))
-        } else {
-            None
-        };
+         let hide_online = if self.hide_online_activity {
+             Some(("forGodSakePleaseDoNotReportAboutMyOnlineActivity", "1".to_string()))
+         } else {
+             None
+         };
 
-        if let Some(param) = hide_online {
-            query_params.push(param);
-        }
+         if let Some(param) = hide_online {
+             query_params.push(param);
+         }
 
-        let response = self
-            .client
-            .post(&url)
-            .query(&query_params)
-            .send()
-            .await?;
+         self.retry_with_backoff(
+             || async {
+                 let response = self
+                     .client
+                     .post(&url)
+                     .query(&query_params)
+                     .send()
+                     .await?;
 
-        let create_response: WallCreateCommentResponse = response.json().await?;
+                 let create_response: WallCreateCommentResponse = response.json().await?;
 
-        if let Some(error) = create_response.error {
-            error!("OpenVK API error: {}", error.error_msg);
-            return Err(anyhow!("OpenVK API error: {}", error.error_msg));
-        }
+                 if let Some(error) = create_response.error {
+                     error!("OpenVK API error: {}", error.error_msg);
+                     return Err(anyhow!("OpenVK API error: {}", error.error_msg));
+                 }
 
-        let data = create_response
-            .response
-            .ok_or_else(|| anyhow!("No response from wall.createComment"))?;
+                 let data = create_response
+                     .response
+                     .ok_or_else(|| anyhow!("No response from wall.createComment"))?;
 
-        info!("Successfully created reply with ID: {}", data.comment_id);
-        Ok(data.comment_id)
-    }
+                 Ok(data.comment_id)
+             },
+             3,
+         )
+         .await
+         .map(|comment_id| {
+             info!("Successfully created reply with ID: {}", comment_id);
+             comment_id
+         })
+     }
 
     /// Get LongPoll server information
     pub async fn messages_get_longpoll_server(&self) -> Result<LongPollServerData> {
@@ -584,6 +642,62 @@ impl OpenVKClient {
         let body = response.text().await.unwrap_or_default();
         debug!("notifications.markAsViewed response: {}", body);
         Ok(())
+    }
+
+    /// Get user information by ID
+    /// Returns a vector of User objects (usually contains just one user per request)
+    pub async fn users_get(&self, user_ids: Vec<u64>) -> Result<Vec<User>> {
+        let url = format!("{}/method/users.get", self.api_url);
+
+        debug!("Fetching user information for {} user(s)", user_ids.len());
+
+        let user_ids_str = user_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let mut query_params = vec![
+            ("user_ids", user_ids_str),
+            ("fields", "screen_name".to_string()),
+            ("access_token", self.api_token.clone()),
+        ];
+
+        if self.hide_online_activity {
+            query_params.push((
+                "forGodSakePleaseDoNotReportAboutMyOnlineActivity",
+                "1".to_string(),
+            ));
+        }
+
+        let response = self
+            .client
+            .get(&url)
+            .query(&query_params)
+            .send()
+            .await?;
+
+        let json_response: serde_json::Value = response.json().await?;
+
+        // Check for API error
+        if let Some(error) = json_response.get("error") {
+            error!("OpenVK API error getting user info: {}", error);
+            return Err(anyhow!("OpenVK API error: {}", error));
+        }
+
+        // Extract users from response array
+        let users: Vec<User> = json_response
+            .get("response")
+            .and_then(|r| r.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        info!("Fetched info for {} user(s)", users.len());
+        Ok(users)
     }
 
     /// Parse a single LongPoll event to get notification details

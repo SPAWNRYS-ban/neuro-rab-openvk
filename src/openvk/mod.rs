@@ -11,6 +11,30 @@ pub struct RequestParam {
     pub value: String,
 }
 
+/// User information from users.get
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    pub id: u64,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub screen_name: Option<String>,
+}
+
+impl User {
+    /// Get display name (first_name + last_name or screen_name)
+    pub fn display_name(&self) -> String {
+        if let (Some(first), Some(last)) = (&self.first_name, &self.last_name) {
+            format!("{} {}", first, last)
+        } else if let Some(first) = &self.first_name {
+            first.clone()
+        } else if let Some(screen) = &self.screen_name {
+            screen.clone()
+        } else {
+            format!("user_{}", self.id)
+        }
+    }
+}
+
 /// Comment on a wall post
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Comment {
@@ -50,6 +74,34 @@ pub struct Post {
     pub is_pinned: Option<bool>,
     pub is_archived: Option<bool>,
     pub post_type: Option<String>,
+    /// For reposts: contains the original post(s) in the copy chain
+    #[serde(default)]
+    pub copy_history: Option<Vec<Post>>,
+}
+
+impl Post {
+    /// Extract all original posts from repost chain (recursively flattens copy_history)
+    pub fn get_original_posts(&self) -> Vec<Post> {
+        let mut originals = Vec::new();
+        
+        if let Some(copy_history) = &self.copy_history {
+            for copy in copy_history {
+                // Recursively get originals from each level
+                if copy.copy_history.is_some() {
+                    originals.extend(copy.get_original_posts());
+                } else {
+                    originals.push(copy.clone());
+                }
+            }
+        }
+        
+        originals
+    }
+    
+    /// Check if this is a repost/shared post
+    pub fn is_repost(&self) -> bool {
+        self.copy_history.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
