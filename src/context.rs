@@ -110,7 +110,12 @@ impl MentionDetector {
     /// Previously the bot only matched the textual prefix, so a real tag (which
     /// does NOT contain the literal "@НейроРаб" string) was never recognized and
     /// the bot stayed silent. This method fixes that.
-    pub fn contains_mention_for_bot(text: &str, mention: &str, bot_id: u64) -> bool {
+    pub fn contains_mention_for_bot(
+        text: &str,
+        mention: &str,
+        bot_id: u64,
+        aliases: &[String],
+    ) -> bool {
         // 1. Textual prefix match (case-insensitive on the un-@ name).
         let name = mention.replace('@', "");
         let lower = text.to_lowercase();
@@ -118,6 +123,15 @@ impl MentionDetector {
             || (!name.is_empty() && lower.contains(&name.to_lowercase()))
         {
             return true;
+        }
+
+        // 1b. Any configured alias / shortname (case-insensitive), e.g.
+        // "neuroslave" / "@neuroslave".
+        for a in aliases {
+            let a = a.trim().trim_start_matches('@');
+            if !a.is_empty() && lower.contains(&a.to_lowercase()) {
+                return true;
+            }
         }
 
         // 2. Real OpenVK mention tag: [id{bot_id}|...] or [id{bot_id}]

@@ -92,6 +92,55 @@ impl OpenVKClient {
         Ok(data.items)
     }
 
+    /// Get a single wall post by its `owner_id_post_id` identifier.
+    ///
+    /// Used to fetch the POST TEXT a mention/comment is attached to, so the bot
+    /// can include the original post in its conversation context.
+    pub async fn wall_get_by_id(&self, owner_id: i64, post_id: u64) -> Result<Vec<Post>> {
+        let url = format!("{}/method/wall.getById", self.api_url);
+
+        let posts_param = format!("{}_{}", owner_id, post_id);
+        let mut query_params = vec![
+            ("posts", posts_param),
+            ("access_token", self.api_token.clone()),
+            ("extended", "0".to_string()),
+        ];
+
+        if self.hide_online_activity {
+            query_params.push((
+                "forGodSakePleaseDoNotReportAboutMyOnlineActivity",
+                "1".to_string(),
+            ));
+        }
+
+        let response = self.client.get(&url).query(&query_params).send().await?;
+        let text = response.text().await?;
+        debug!(
+            "wall.getById response: {}",
+            text.chars().take(300).collect::<String>()
+        );
+
+        let json: serde_json::Value = serde_json::from_str(&text)?;
+        if let Some(error) = json.get("error") {
+            return Err(anyhow!("wall.getById API error: {}", error));
+        }
+
+        let items_val = json.get("response").and_then(|r| {
+            if r.is_array() {
+                Some(r.clone())
+            } else {
+                r.get("items").cloned()
+            }
+        });
+
+        let posts: Vec<Post> = match items_val {
+            Some(v) => serde_json::from_value(v).unwrap_or_default(),
+            None => Vec::new(),
+        };
+
+        Ok(posts)
+    }
+
     /// Get comments for a specific wall post
     pub async fn wall_get_comments(
         &self,

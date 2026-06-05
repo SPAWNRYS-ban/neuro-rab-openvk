@@ -12,7 +12,7 @@ use anyhow::Result;
 use config::{Config, BotMode};
 use context::{ContextManager, MentionDetector};
 use db::Database;
-use log::{error, info};
+use log::{error, info, warn};
 use openvk::{OpenVKClient, ParsedNotification, Comment, Notification};
 
 use std::sync::Arc;
@@ -209,6 +209,7 @@ async fn run_longpoll_listener(
         Ok(existing) => {
             let mut seeded = 0u32;
             for notif in &existing {
+                // Seed the notification's own dedup id (post-level mention).
                 if let Some(dedup_id) = notification_dedup_id(notif) {
                     if !db.is_comment_processed(dedup_id).unwrap_or(false) {
                         let _ = db.add_processed_comment(&db::ProcessedComment {
@@ -221,8 +222,45 @@ async fn run_longpoll_listener(
                         seeded += 1;
                     }
                 }
+
+                // ALSO seed every existing comment under the mentioned post as
+                // processed. Real OpenVK mention notifications point at the POST
+                // (not the comment), so freshness for comment-mentions is keyed
+                // by the comment id (id*10+2). Without seeding these, a restart
+                // would make the bot re-answer every old comment mention.
+                let ntype = notif.notification_type.as_deref().unwrap_or("");
+                let post_src = if ntype == "mention" {
+                    notif.feedback.as_ref()
+                } else if ntype == "comment_post" {
+                    notif.parent.as_ref()
+                } else {
+                    None
+                };
+                if let Some(p) = post_src {
+                    if let Some(pid) = p.id {
+                        let owner = p.to_id.or(p.owner_id).unwrap_or(0);
+                        if let Ok(comments) = openvk_client
+                            .wall_get_comments(owner, pid as u64, 100, 0)
+                            .await
+                        {
+                            for c in &comments {
+                                let cdedup = c.id.wrapping_mul(10).wrapping_add(2);
+                                if !db.is_comment_processed(cdedup).unwrap_or(false) {
+                                    let _ = db.add_processed_comment(&db::ProcessedComment {
+                                        comment_id: cdedup,
+                                        wall_owner_id: owner,
+                                        comment_text: "[seeded comment on startup]".to_string(),
+                                        bot_response: String::new(),
+                                        processed_at: chrono::Utc::now().to_rfc3339(),
+                                    });
+                                    seeded += 1;
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            info!("Seeded {} existing notifications as processed on startup", seeded);
+            info!("Seeded {} existing notifications/comments as processed on startup", seeded);
             // Clear the unread badge in the web UI for the startup backlog.
             let _ = openvk_client.notifications_mark_as_viewed().await;
         }
@@ -257,10 +295,32 @@ async fn run_longpoll_listener(
                 }
             }
             Err(e) => {
-                error!("LongPoll error: {} — re-fetching server, retrying in 3s", e);
-                sleep(Duration::from_secs(3)).await;
-                if let Ok(sd) = openvk_client.messages_get_longpoll_server().await {
-                    server_data = sd;
+                // Distinguish a transient NETWORK timeout from a real API error.
+                //
+                // A timeout just means openvk.xyz was slow to respond this once.
+                // We must NOT re-fetch the LongPoll server in that case, because
+                // re-fetching resets `ts` and can DROP events that arrived between
+                // the old and new ts (i.e. silently lose messages). Instead we
+                // keep the SAME `ts` and simply retry — getLongPollHistory will
+                // return those events on the next poll. Only a genuine API /
+                // protocol error (e.g. an expired ts) warrants re-fetching.
+                let msg = e.to_string().to_lowercase();
+                let is_transient = msg.contains("timed out")
+                    || msg.contains("timeout")
+                    || msg.contains("error sending request")
+                    || msg.contains("connection")
+                    || msg.contains("connect")
+                    || msg.contains("body");
+
+                if is_transient {
+                    warn!("LongPoll transient network error: {} — retrying with same ts in 2s", e);
+                    sleep(Duration::from_secs(2)).await;
+                } else {
+                    error!("LongPoll API error: {} — re-fetching server, retrying in 3s", e);
+                    sleep(Duration::from_secs(3)).await;
+                    if let Ok(sd) = openvk_client.messages_get_longpoll_server().await {
+                        server_data = sd;
+                    }
                 }
             }
         }
@@ -305,19 +365,19 @@ async fn run_longpoll_listener(
 
 /// Handle a single notification from notifications.get.
 ///
-/// Real OpenVK format (from Notification::toVkApiStruct / getVkApiInfo):
-///   - type = "mention":      feedback = the POST the bot was mentioned in
-///                            (NotifObject: id=post_virtual_id, to_id=wall_owner, from_id, text)
-///   - type = "comment_post": parent   = the POST, feedback = the COMMENT
-///                            (comment NotifObject: id=comment_id, owner_id, text)
+/// IMPORTANT (learned from real openvk.xyz data): when the bot is tagged, OpenVK
+/// sends `type:"mention"` whose `feedback` is the POST (parent:null, with NO
+/// comment id) — even when the actual tag was written INSIDE a comment. So we
+/// cannot learn the triggering comment from the notification alone. Instead we
+/// resolve the post, load its whole comment thread, and:
+///   1. reply IN-THREAD (wall.createComment + reply_to_comment) to every comment
+///      that mentions the bot and hasn't been handled yet, and
+///   2. if the POST text itself mentions the bot, post one top-level comment.
 ///
-/// We respond by posting a comment (or reply) on the post, and we load the
-/// whole comment thread into context first so the bot knows the conversation.
+/// Context (post text + full thread) is seeded before generating each reply so
+/// the bot understands the whole conversation, not just the trigger line.
 ///
-/// Returns `Ok(true)` if the bot actually posted a reply for this notification
-/// (used by the caller to decide whether to mark notifications as viewed),
-/// `Ok(false)` if the notification was skipped (wrong type, already processed,
-/// no real mention, etc.).
+/// Returns `Ok(true)` if the bot posted at least one reply.
 async fn handle_notification(
     notif: &Notification,
     openvk_client: &OpenVKClient,
@@ -329,180 +389,246 @@ async fn handle_notification(
     config: &Config,
 ) -> Result<bool> {
     let ntype = notif.notification_type.as_deref().unwrap_or("");
-
-    // We only care about mentions in posts and comments on posts.
     let is_mention = ntype == "mention";
     let is_comment_post = ntype == "comment_post";
     if !is_mention && !is_comment_post {
         return Ok(false);
     }
 
-    // NOTE: We deliberately do NOT filter by a timestamp cutoff anymore. Clock
-    // skew between the OpenVK server and this host made valid NEW notifications
-    // look "old" and get dropped. Freshness is now decided purely by our local
-    // database (the dedup id below): if we've already handled it, skip it;
-    // otherwise it's new. Old backlog is seeded as processed on startup.
-
-    // Determine the POST object (where to comment) and the text/author that
-    // triggered the notification.
-    // - For "mention": the post itself is in `feedback`.
-    // - For "comment_post": the post is in `parent`, the comment is in `feedback`.
-    let post_obj = if is_mention {
+    // Resolve the POST (id + owner + text). For a "mention" the post is in
+    // `feedback`; for a "comment_post" it's in `parent`.
+    let post_src = if is_mention {
         notif.feedback.as_ref()
     } else {
         notif.parent.as_ref()
     };
-
-    let post_obj = match post_obj {
+    let post_src = match post_src {
         Some(p) => p,
         None => {
             info!("Notification ({}) has no post object, skipping", ntype);
             return Ok(false);
         }
     };
-
-    // Post id: for a post NotifObject this is `id`; wall owner is `to_id`.
-    let post_id = match post_obj.id {
+    let post_id = match post_src.id {
         Some(id) => id as u64,
         None => {
             info!("Notification ({}) post has no id, skipping", ntype);
             return Ok(false);
         }
     };
-    let owner_id = post_obj.to_id.or(post_obj.owner_id).unwrap_or(0);
+    let owner_id = post_src.to_id.or(post_src.owner_id).unwrap_or(0);
+    let post_text = post_src.text.clone().unwrap_or_default();
 
-    // The text that triggered us + the author who wrote it.
-    let trigger = notif.feedback.as_ref();
-    let trigger_text = trigger.and_then(|f| f.text.clone()).unwrap_or_default();
-    let trigger_author = trigger
-        .and_then(|f| f.from_id.or(f.owner_id))
-        .unwrap_or(owner_id);
-
-    // For comment_post we only respond if the bot is ACTUALLY mentioned.
-    // This now recognizes BOTH the textual prefix (@НейроРаб / НейроРаб) AND
-    // the real OpenVK mention tag [id{bot_id}|...] the platform inserts when
-    // you tag the bot from the UI (previously only the textual prefix matched,
-    // so real tags were ignored and the bot stayed silent).
-    if is_comment_post
-        && !MentionDetector::contains_mention_for_bot(
-            &trigger_text,
-            &config.bot_mention_prefix,
-            config.openvk_bot_id,
-        )
-    {
-        return Ok(false);
-    }
-
-    // Deduplicate using a STABLE key derived from the triggering object id
-    // (feedback.id). For a "mention" this is the post id; for "comment_post"
-    // this is the comment id. We must NOT mix in `notif.date`, because OpenVK
-    // returns the SAME mention multiple times with DIFFERENT dates, which
-    // would otherwise make the bot answer the same mention repeatedly.
-    //
-    // We namespace the two notification kinds so a post id and a comment id
-    // can never collide.
-    let trigger_id = trigger.and_then(|f| f.id).unwrap_or(post_id as i64) as u64;
-    let dedup_id: u64 = if is_mention {
-        trigger_id.wrapping_mul(10).wrapping_add(1)
-    } else {
-        trigger_id.wrapping_mul(10).wrapping_add(2)
-    };
-    if db.is_comment_processed(dedup_id)? {
-        return Ok(false);
-    }
-
-
-    info!(
-        "📨 Handling {} on post {}_{} | trigger=\"{}\"",
-        ntype, owner_id, post_id,
-        truncate_str(&trigger_text, 60)
-    );
-
-
-    // Load the whole comment thread into context so the bot knows the
-    // conversation. This is best-effort: a failure here (e.g. the virtual
-    // mention post returns no comments) must NOT prevent the bot from replying.
-    if let Ok(comments) = openvk_client.wall_get_comments(owner_id, post_id, 100, 0).await {
-        for c in &comments {
-            context_manager
-                .add_comment_context(
-                    owner_id,
-                    post_id,
-                    c.author_id,
-                    c.author_id.to_string(),
-                    c.text.clone(),
-                )
-                .await
-                .ok();
-        }
-    }
-
-    // Build a synthetic Comment for the AI generator using the trigger text.
-    let trigger_comment = Comment {
-        id: dedup_id,
-        owner_id,
-        author_id: trigger_author.unsigned_abs(),
-        text: if trigger_text.is_empty() {
-            format!("{} ?", config.bot_mention_prefix)
-        } else {
-            trigger_text.clone()
-        },
-        reply_to_comment: None,
-        reply_to_user: None,
-        date: notif.date.unwrap_or(0),
-        likes_count: None,
-        likes: None,
-        attachments: None,
-        can_edit: None,
-        can_delete: None,
-    };
-
-    match generate_bot_response(
-        &trigger_comment,
-        claude_ai,
-        search_engine,
-        scraper,
-        context_manager,
-        config,
-        owner_id,
-        post_id,
-    )
-    .await
-    {
-        Ok(response) => {
-            match openvk_client
-                .wall_create_comment(owner_id, post_id, response.clone())
-                .await
-            {
-                Ok(cid) => {
-                    info!("✅ Posted comment {} on post {}_{}", cid, owner_id, post_id);
-                    // Record the bot's own answer into context too.
-                    context_manager
-                        .add_comment_context(
-                            owner_id,
-                            post_id,
-                            config.openvk_bot_id,
-                            config.bot_name.clone(),
-                            response.clone(),
-                        )
-                        .await
-                        .ok();
-                    db.add_processed_comment(&db::ProcessedComment {
-                        comment_id: dedup_id,
-                        wall_owner_id: owner_id,
-                        comment_text: trigger_text,
-                        bot_response: response,
-                        processed_at: chrono::Utc::now().to_rfc3339(),
-                    })?;
-                    return Ok(true);
-                }
-                Err(e) => error!("Failed to post comment response: {}", e),
+    // --- Seed the POST text into context (best-effort). ---
+    if !post_text.trim().is_empty() {
+        context_manager
+            .add_comment_context(
+                owner_id,
+                post_id,
+                owner_id.unsigned_abs(),
+                "Пост".to_string(),
+                post_text.clone(),
+            )
+            .await
+            .ok();
+    } else if let Ok(posts) = openvk_client.wall_get_by_id(owner_id, post_id).await {
+        for p in &posts {
+            if !p.text.trim().is_empty() {
+                context_manager
+                    .add_comment_context(
+                        owner_id,
+                        post_id,
+                        p.from_id.unwrap_or(owner_id).unsigned_abs(),
+                        "Пост".to_string(),
+                        p.text.clone(),
+                    )
+                    .await
+                    .ok();
             }
         }
-        Err(e) => error!("Failed to generate response for {}: {}", ntype, e),
     }
 
-    Ok(false)
+    // --- Load the whole comment thread and seed it into context. ---
+    let comments = openvk_client
+        .wall_get_comments(owner_id, post_id, 100, 0)
+        .await
+        .unwrap_or_default();
+    for c in &comments {
+        context_manager
+            .add_comment_context(
+                owner_id,
+                post_id,
+                c.author_id,
+                c.author_id.to_string(),
+                c.text.clone(),
+            )
+            .await
+            .ok();
+    }
+
+    let mut handled = false;
+
+    // --- 1. Reply IN-THREAD to each comment that mentions the bot. ---
+    for c in &comments {
+        // Never reply to ourselves.
+        if c.author_id == config.openvk_bot_id {
+            continue;
+        }
+        if !MentionDetector::contains_mention_for_bot(
+            &c.text,
+            &config.bot_mention_prefix,
+            config.openvk_bot_id,
+            &config.bot_mention_aliases,
+        ) {
+            continue;
+        }
+        // Stable dedup key per comment (namespaced with +2 like comment_post).
+        let dedup_id = c.id.wrapping_mul(10).wrapping_add(2);
+        if db.is_comment_processed(dedup_id)? {
+            continue;
+        }
+
+        info!(
+            "📨 Mention in comment {} on post {}_{} | text=\"{}\"",
+            c.id, owner_id, post_id, truncate_str(&c.text, 60)
+        );
+
+        let trigger_comment = Comment {
+            id: dedup_id,
+            owner_id,
+            author_id: c.author_id,
+            text: c.text.clone(),
+            reply_to_comment: None,
+            reply_to_user: None,
+            date: c.date,
+            likes_count: None,
+            likes: None,
+            attachments: None,
+            can_edit: None,
+            can_delete: None,
+        };
+
+        match generate_bot_response(
+            &trigger_comment,
+            claude_ai,
+            search_engine,
+            scraper,
+            context_manager,
+            config,
+            owner_id,
+            post_id,
+        )
+        .await
+        {
+            Ok(response) => {
+                match openvk_client
+                    .wall_create_comment_reply(owner_id, post_id, c.id, response.clone())
+                    .await
+                {
+                    Ok(cid) => {
+                        info!("✅ Replied (comment {}) to comment {} on post {}_{}", cid, c.id, owner_id, post_id);
+                        context_manager
+                            .add_comment_context(
+                                owner_id,
+                                post_id,
+                                config.openvk_bot_id,
+                                config.bot_name.clone(),
+                                response.clone(),
+                            )
+                            .await
+                            .ok();
+                        db.add_processed_comment(&db::ProcessedComment {
+                            comment_id: dedup_id,
+                            wall_owner_id: owner_id,
+                            comment_text: c.text.clone(),
+                            bot_response: response,
+                            processed_at: chrono::Utc::now().to_rfc3339(),
+                        })?;
+                        handled = true;
+                    }
+                    Err(e) => error!("Failed to post reply to comment {}: {}", c.id, e),
+                }
+            }
+            Err(e) => error!("Failed to generate reply for comment {}: {}", c.id, e),
+        }
+    }
+
+    // --- 2. If the POST text itself mentions the bot, reply top-level once. ---
+    if MentionDetector::contains_mention_for_bot(
+        &post_text,
+        &config.bot_mention_prefix,
+        config.openvk_bot_id,
+        &config.bot_mention_aliases,
+    ) {
+        let dedup_id = post_id.wrapping_mul(10).wrapping_add(1);
+        if !db.is_comment_processed(dedup_id)? {
+            info!("📨 Mention in POST {}_{}", owner_id, post_id);
+            let trigger_comment = Comment {
+                id: dedup_id,
+                owner_id,
+                author_id: owner_id.unsigned_abs(),
+                text: if post_text.is_empty() {
+                    format!("{} ?", config.bot_mention_prefix)
+                } else {
+                    post_text.clone()
+                },
+                reply_to_comment: None,
+                reply_to_user: None,
+                date: notif.date.unwrap_or(0),
+                likes_count: None,
+                likes: None,
+                attachments: None,
+                can_edit: None,
+                can_delete: None,
+            };
+
+            match generate_bot_response(
+                &trigger_comment,
+                claude_ai,
+                search_engine,
+                scraper,
+                context_manager,
+                config,
+                owner_id,
+                post_id,
+            )
+            .await
+            {
+                Ok(response) => {
+                    match openvk_client
+                        .wall_create_comment(owner_id, post_id, response.clone())
+                        .await
+                    {
+                        Ok(cid) => {
+                            info!("✅ Posted top-level comment {} on post {}_{}", cid, owner_id, post_id);
+                            context_manager
+                                .add_comment_context(
+                                    owner_id,
+                                    post_id,
+                                    config.openvk_bot_id,
+                                    config.bot_name.clone(),
+                                    response.clone(),
+                                )
+                                .await
+                                .ok();
+                            db.add_processed_comment(&db::ProcessedComment {
+                                comment_id: dedup_id,
+                                wall_owner_id: owner_id,
+                                comment_text: post_text.clone(),
+                                bot_response: response,
+                                processed_at: chrono::Utc::now().to_rfc3339(),
+                            })?;
+                            handled = true;
+                        }
+                        Err(e) => error!("Failed to post top-level comment: {}", e),
+                    }
+                }
+                Err(e) => error!("Failed to generate response for post mention: {}", e),
+            }
+        }
+    }
+
+    Ok(handled)
 }
 
 
@@ -713,6 +839,7 @@ async fn process_post(
             &comment.text,
             &config.bot_mention_prefix,
             config.openvk_bot_id,
+            &config.bot_mention_aliases,
         ) {
             continue;
         }

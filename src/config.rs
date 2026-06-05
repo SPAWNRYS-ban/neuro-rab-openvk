@@ -43,6 +43,7 @@ pub struct Config {
     pub bot_name: String,
     pub context_memory_size: usize,
     pub notif_poll_interval_secs: u64,
+    pub bot_mention_aliases: Vec<String>,
 }
 
 impl Config {
@@ -107,6 +108,16 @@ impl Config {
             notif_poll_interval_secs: env::var("NOTIF_POLL_INTERVAL_SECS")
                 .unwrap_or_else(|_| "10".to_string())
                 .parse()?,
+            // Extra textual handles that count as mentioning the bot, in
+            // ADDITION to the [id{bot_id}|...] tag and BOT_MENTION_PREFIX.
+            // Real OpenVK comments tag the bot by its latin shortname
+            // (e.g. "@neuroslave"), which differs from the display prefix.
+            bot_mention_aliases: env::var("BOT_MENTION_ALIASES")
+                .unwrap_or_else(|_| "neuroslave,НейроРаб".to_string())
+                .split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect(),
         })
     }
 }

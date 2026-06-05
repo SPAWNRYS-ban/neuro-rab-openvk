@@ -15,7 +15,12 @@ pub struct RequestParam {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Comment {
     pub id: u64,
+    #[serde(default)]
     pub owner_id: i64,
+    // OpenVK returns the comment author under `from_id` (NOT `author_id`).
+    // Without this alias, deserialization FAILS and the bot silently sees ZERO
+    // comments — so it never finds the mention and never replies.
+    #[serde(alias = "from_id", default)]
     pub author_id: u64,
     pub text: String,
     pub reply_to_comment: Option<u64>,
