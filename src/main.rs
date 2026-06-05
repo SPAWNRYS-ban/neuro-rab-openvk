@@ -1068,13 +1068,22 @@ async fn generate_bot_response(
         }
     } else {
         // No images - use regular text-based response
-        let needs_web_search = clean_text.contains("проверить") || clean_text.contains("найти")
-            || clean_text.contains("check") || clean_text.contains("search")
-            || clean_text.contains("look");
+        
+        // If text is empty, use a default prompt to prevent sending empty message to Claude
+        let prompt_text = if clean_text.is_empty() {
+            info!("⚠️  Empty text in post, using default prompt");
+            "Напиши интересный и полезный ответ на этот пост, учитывая контекст фила.".to_string()
+        } else {
+            clean_text.clone()
+        };
+        
+        let needs_web_search = prompt_text.contains("проверить") || prompt_text.contains("найти")
+            || prompt_text.contains("check") || prompt_text.contains("search")
+            || prompt_text.contains("look");
 
         if needs_web_search {
             // Perform web search
-            match search_engine.search(&clean_text).await {
+            match search_engine.search(&prompt_text).await {
                 Ok(results) => {
                     if !results.is_empty() {
                         let search_context = results
@@ -1086,27 +1095,27 @@ async fn generate_bot_response(
 
                         let ai_prompt = format!(
                             "Основываясь на следующих результатах поиска, ответь на вопрос: {}\n\nРезультаты:\n{}",
-                            clean_text, search_context
+                            prompt_text, search_context
                         );
 
                         claude_ai.generate_response_with_context(ai_prompt, context).await?
                     } else {
                         claude_ai
-                            .generate_response_with_context(clean_text.clone(), context)
+                            .generate_response_with_context(prompt_text.clone(), context)
                             .await?
                     }
                 }
                 Err(e) => {
                     error!("Web search failed: {}", e);
                     claude_ai
-                        .generate_response_with_context(clean_text.clone(), context)
+                        .generate_response_with_context(prompt_text.clone(), context)
                         .await?
                 }
             }
         } else {
             // Regular response
             claude_ai
-                .generate_response_with_context(clean_text.clone(), context)
+                .generate_response_with_context(prompt_text.clone(), context)
                 .await?
         }
     };
@@ -1191,7 +1200,7 @@ async fn handle_wall_posts(
             date: post.date,
             likes_count: None,
             likes: None,
-            attachments: None,
+            attachments: post.attachments.clone(),
             can_edit: None,
             can_delete: None,
         };
